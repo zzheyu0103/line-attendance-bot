@@ -44,7 +44,10 @@ db.exec(`
     ('shift_start','09:00'),
     ('late_grace_minutes','5'),
     ('standard_hours','8'),
-    ('minimum_daily_staff','1');
+    ('minimum_daily_staff','1'),
+    ('break_minutes','60'),
+    ('weekday_overtime_multiplier','1.34'),
+    ('holiday_overtime_multiplier','1.67');
   CREATE TABLE IF NOT EXISTS schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     line_user_id TEXT NOT NULL,
@@ -64,9 +67,26 @@ db.exec(`
     created_at TEXT NOT NULL,
     FOREIGN KEY(line_user_id) REFERENCES employees(line_user_id)
   );
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_logs(created_at);
 `);
 for (const sql of [
   'ALTER TABLE employees ADD COLUMN custom_name TEXT',
+  "ALTER TABLE employees ADD COLUMN employee_no TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE employees ADD COLUMN department TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE employees ADD COLUMN hire_date TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE employees ADD COLUMN termination_date TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE employees ADD COLUMN salary_type TEXT NOT NULL DEFAULT 'hourly'",
+  'ALTER TABLE employees ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0',
+  'ALTER TABLE employees ADD COLUMN monthly_salary REAL NOT NULL DEFAULT 0',
   "ALTER TABLE attendance ADD COLUMN source TEXT NOT NULL DEFAULT 'line'",
   "ALTER TABLE attendance ADD COLUMN note TEXT NOT NULL DEFAULT ''",
 ]) {
@@ -109,7 +129,12 @@ async function lineCall(operation, attempts = 3) {
 }
 function getSettings() {
   const values = Object.fromEntries(db.prepare('SELECT key,value FROM settings').all().map((r) => [r.key, r.value]));
-  return { shiftStart: values.shift_start || '09:00', lateGrace: Number(values.late_grace_minutes || 5), standardHours: Number(values.standard_hours || 8), minimumStaff: Number(values.minimum_daily_staff || 1) };
+  return { shiftStart: values.shift_start || '09:00', lateGrace: Number(values.late_grace_minutes || 5), standardHours: Number(values.standard_hours || 8), minimumStaff: Number(values.minimum_daily_staff || 1), breakMinutes: Number(values.break_minutes || 60), weekdayOvertimeMultiplier: Number(values.weekday_overtime_multiplier || 1.34), holidayOvertimeMultiplier: Number(values.holiday_overtime_multiplier || 1.67) };
+}
+
+function audit(action, targetType, targetId, details = '') {
+  db.prepare('INSERT INTO audit_logs(actor,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
+    .run('管理員', action, targetType, String(targetId || ''), String(details || '').slice(0, 1000), taipeiDate());
 }
 
 function shiftHours(start, end) {
@@ -325,6 +350,7 @@ app.post('/admin/schedules/bulk', requireAdmin, requireCsrf, (req, res) => {
       for (const userId of userIds) if (approved.has(userId) && !leaveDays.has(`${userId}|${date}`)) save.run(userId, date, startTime, endTime, String(req.body.note || '').slice(0, 100));
     }
   })();
+  audit('批次建立班表', 'schedule', `${fromDate}~${toDate}`, `員工=${userIds.length}；星期=${[...weekdays].join(',')}`);
   res.redirect(303, `/admin/schedules?week=${week}`);
 });
 
@@ -332,6 +358,7 @@ app.post('/admin/schedules/settings', requireAdmin, requireCsrf, (req, res) => {
   const minimumStaff = Math.max(0, Math.min(99, Number(req.body.minimumStaff) || 0));
   db.prepare(`INSERT INTO settings(key,value) VALUES ('minimum_daily_staff',?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(minimumStaff));
+  audit('修改最低人力', 'settings', 'minimum_daily_staff', String(minimumStaff));
   res.redirect(303, `/admin/schedules?week=${mondayOf(req.body.week)}`);
 });
 
@@ -353,7 +380,35 @@ app.post('/admin/schedules/copy-week', requireAdmin, requireCsrf, (req, res) => 
   const save = db.prepare(`INSERT INTO schedules(line_user_id,work_date,start_time,end_time,note) VALUES (?,?,?,?,?)
     ON CONFLICT(line_user_id,work_date) DO UPDATE SET start_time=excluded.start_time,end_time=excluded.end_time,note=excluded.note`);
   db.transaction(() => source.forEach((shift) => save.run(shift.line_user_id, addDays(shift.work_date, 7), shift.start_time, shift.end_time, shift.note)))();
+  audit('複製整週班表', 'schedule', targetWeek, `來源=${sourceWeek}；${source.length} 筆`);
   res.redirect(303, `/admin/schedules?week=${targetWeek}`);
+});
+
+app.get('/admin/audit', requireAdmin, (req, res) => {
+  const logs = db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 300').all();
+  const rows = logs.map((log) => `<tr><td>${escapeHtml(log.created_at)}</td><td>${escapeHtml(log.actor)}</td><td>${escapeHtml(log.action)}</td><td>${escapeHtml(log.target_type)} #${escapeHtml(log.target_id)}</td><td class="audit-details">${escapeHtml(log.details)}</td></tr>`).join('');
+  res.send(page('稽核紀錄', `<header><div><h1>稽核紀錄</h1><p>保留最近 300 筆後台變更</p></div><nav><a href="/admin">返回出勤管理</a><a href="/admin/anomalies">異常中心</a></nav></header><main class="standalone"><article><div class="panel-title"><span>Audit trail</span><h2>資料修改歷程</h2></div><div class="table-wrap"><table><thead><tr><th>時間</th><th>操作者</th><th>動作</th><th>對象</th><th>修改前內容／說明</th></tr></thead><tbody>${rows || '<tr><td colspan="5">尚無修改紀錄</td></tr>'}</tbody></table></div></article></main>`));
+});
+
+app.get('/admin/anomalies', requireAdmin, (req, res) => {
+  const now = taipeiDate();
+  const today = dayPrefix();
+  const employees = db.prepare(`SELECT line_user_id,COALESCE(NULLIF(custom_name,''),display_name) name FROM employees WHERE approved=1`).all();
+  const issues = [];
+  for (const employee of employees) {
+    const latest = db.prepare('SELECT type,occurred_at FROM attendance WHERE line_user_id=? ORDER BY occurred_at DESC,id DESC LIMIT 1').get(employee.line_user_id);
+    if (latest?.type === 'clock_in') {
+      const openHours = (toMillis(now) - toMillis(latest.occurred_at)) / 3600000;
+      if (openHours >= 12) issues.push({ level: openHours > 24 ? 'high' : 'medium', name: employee.name, title: openHours > 24 ? '上班超過 24 小時' : '疑似忘記下班', detail: `自 ${latest.occurred_at} 起已 ${openHours.toFixed(1)} 小時` });
+    }
+    const shift = db.prepare('SELECT start_time,end_time FROM schedules WHERE line_user_id=? AND work_date=?').get(employee.line_user_id, today);
+    const clockIn = db.prepare("SELECT occurred_at FROM attendance WHERE line_user_id=? AND type='clock_in' AND occurred_at LIKE ? ORDER BY occurred_at LIMIT 1").get(employee.line_user_id, `${today}%`);
+    if (shift && !clockIn && toMillis(now) > toMillis(`${today} ${shift.start_time}:00`) + getSettings().lateGrace * 60000) issues.push({ level: 'high', name: employee.name, title: '未依排班上班', detail: `今日排班 ${shift.start_time}–${shift.end_time}，目前尚無上班打卡` });
+    const recent = db.prepare('SELECT type,occurred_at FROM attendance WHERE line_user_id=? ORDER BY occurred_at DESC,id DESC LIMIT 2').all(employee.line_user_id);
+    if (recent.length === 2 && recent[0].type === recent[1].type) issues.push({ level: 'medium', name: employee.name, title: '連續相同打卡', detail: `${recent[1].occurred_at}、${recent[0].occurred_at} 皆為${recent[0].type === 'clock_in' ? '上班' : '下班'}` });
+  }
+  const issueHtml = issues.map((issue) => `<article class="issue ${issue.level}"><div><span>${issue.level === 'high' ? '需立即處理' : '請確認'}</span><h2>${escapeHtml(issue.title)}</h2></div><b>${escapeHtml(issue.name)}</b><p>${escapeHtml(issue.detail)}</p></article>`).join('');
+  res.send(page('出勤異常中心', `<header><div><h1>異常中心</h1><p>${now} 即時檢查</p></div><nav><a href="/admin">返回出勤管理</a><a href="/admin/audit">稽核紀錄</a></nav></header><main class="standalone"><section class="issue-summary"><b>${issues.length}</b><span>目前需確認項目</span></section><section class="issue-list">${issueHtml || '<div class="all-clear">✓ 目前沒有偵測到異常</div>'}</section></main>`));
 });
 
 app.get('/admin', (req, res) => {
@@ -361,7 +416,7 @@ app.get('/admin', (req, res) => {
   if (!authorized(req)) return res.redirect('/admin/login');
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : monthPrefix();
   const settings = getSettings();
-  const employees = db.prepare(`SELECT line_user_id,display_name,custom_name,approved,COALESCE(NULLIF(custom_name,''),display_name) AS name FROM employees ORDER BY approved,name`).all();
+  const employees = db.prepare(`SELECT *,COALESCE(NULLIF(custom_name,''),display_name) AS name FROM employees ORDER BY approved,name`).all();
   const rows = db.prepare(`SELECT a.id,a.line_user_id,a.type,a.occurred_at,a.source,a.note,
     COALESCE(NULLIF(e.custom_name,''),e.display_name) AS name FROM attendance a JOIN employees e USING(line_user_id)
     WHERE a.occurred_at LIKE ? ORDER BY name,a.occurred_at,a.id`).all(`${month}%`);
@@ -382,12 +437,12 @@ app.get('/admin', (req, res) => {
   const leaves = db.prepare(`SELECT l.*,COALESCE(NULLIF(e.custom_name,''),e.display_name) name FROM leave_requests l JOIN employees e USING(line_user_id) ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,id DESC LIMIT 30`).all();
   const leaveLabels = { pending: '待審核', approved: '已核准', rejected: '已駁回' };
   const leaveRows = leaves.map((l) => `<tr><td>${l.leave_date}</td><td>${escapeHtml(l.name)}</td><td>${escapeHtml(l.reason)}</td><td><span class="status-${l.status}">${leaveLabels[l.status]}</span></td><td>${l.status === 'pending' ? `<form method="post" action="/admin/leave/status"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${l.id}"><button name="status" value="approved">核准</button><button class="danger" name="status" value="rejected">駁回</button></form>` : ''}</td></tr>`).join('');
-  res.send(page('LINE 打卡管理', `<header><div><h1>出勤管理</h1><p>${month} 月報表</p></div><nav><a href="/admin/schedules">排班中心</a><a href="/admin/export?month=${month}">匯出 CSV</a><a href="/admin/backup">備份資料</a><a href="/admin/logout">登出</a></nav></header>
+  res.send(page('LINE 打卡管理', `<header><div><h1>出勤管理</h1><p>${month} 月報表</p></div><nav><a href="/admin/schedules">排班中心</a><a href="/admin/anomalies">異常中心</a><a href="/admin/audit">稽核紀錄</a><a href="/admin/export?month=${month}">匯出 CSV</a><a href="/admin/backup">備份資料</a><a href="/admin/logout">登出</a></nav></header>
     <nav class="section-nav"><a href="#overview">總覽</a><a href="#tools">設定與補登</a><a href="#schedule">排班</a><a href="#leave">請假</a><a href="#employees">員工紀錄</a></nav>
     <section id="overview" class="today"><div><b>${activeEmployees.length}</b><span>正式員工</span></div><div><b>${arrived}</b><span>今日已到</span></div><div><b>${working}</b><span>目前上班中</span></div></section>
     ${pending.length ? `<section class="pending-box"><h2>待核准員工 <span>${pending.length}</span></h2>${pendingHtml}</section>` : ''}
     <section id="tools" class="toolbar"><div class="section-heading"><span>管理工具</span><h2>設定與補登</h2></div><form><label>月份<input type="month" name="month" value="${month}"></label><button>查詢</button></form>
-    <form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="${csrfValue}"><label>標準上班時間<input type="time" name="shiftStart" value="${settings.shiftStart}" required></label><label>寬限分鐘<input type="number" name="lateGrace" value="${settings.lateGrace}" min="0" max="120" required></label><label>每日標準工時<input type="number" name="standardHours" value="${settings.standardHours}" min="1" max="24" step="0.5" required></label><button>儲存班別</button></form>
+    <form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="${csrfValue}"><label>標準上班時間<input type="time" name="shiftStart" value="${settings.shiftStart}" required></label><label>寬限分鐘<input type="number" name="lateGrace" value="${settings.lateGrace}" min="0" max="120" required></label><label>每日標準工時<input type="number" name="standardHours" value="${settings.standardHours}" min="1" max="24" step="0.5" required></label><label>休息分鐘<input type="number" name="breakMinutes" value="${settings.breakMinutes}" min="0" max="480" required></label><label>平日加班倍率<input type="number" name="weekdayOvertimeMultiplier" value="${settings.weekdayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label><label>假日加班倍率<input type="number" name="holidayOvertimeMultiplier" value="${settings.holidayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label><button>儲存薪資規則</button></form>
     <form method="post" action="/admin/attendance/add"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="month" value="${month}"><label>員工<select name="userId" required>${options}</select></label><label>類型<select name="type"><option value="clock_in">上班</option><option value="clock_out">下班</option></select></label><label>時間<input type="datetime-local" name="occurredAt" required></label><label>備註<input name="note" maxlength="100"></label><button>補登</button></form></section>
     <section class="operations"><article id="schedule"><h2>排班管理</h2><form method="post" action="/admin/schedule"><input type="hidden" name="csrf" value="${csrfValue}"><label>員工<select name="userId" required>${options}</select></label><label>日期<input type="date" name="workDate" required></label><label>上班<input type="time" name="startTime" value="${settings.shiftStart}" required></label><label>下班<input type="time" name="endTime" value="18:00" required></label><label>備註<input name="note" maxlength="100"></label><button>新增／更新</button></form><div class="table-wrap"><table><thead><tr><th>日期</th><th>員工</th><th>班別</th><th>備註</th><th></th></tr></thead><tbody>${scheduleRows || '<tr><td colspan="5">未來 30 天尚無排班</td></tr>'}</tbody></table></div></article>
     <article id="leave"><h2>請假審核</h2><div class="table-wrap"><table><thead><tr><th>日期</th><th>員工</th><th>原因</th><th>狀態</th><th></th></tr></thead><tbody>${leaveRows || '<tr><td colspan="5">尚無請假申請</td></tr>'}</tbody></table></div></article></section>
@@ -398,14 +453,26 @@ app.get('/admin', (req, res) => {
 
 function employeeCard(employee, settings) {
   const summary = summarize(employee.rows, settings);
+  const baseRate = employee.salary_type === 'monthly' ? Number(employee.monthly_salary || 0) / 240 : Number(employee.hourly_rate || 0);
+  const estimatedPay = employee.salary_type === 'monthly' ? Number(employee.monthly_salary || 0) + summary.weekdayOvertimeHours * baseRate * settings.weekdayOvertimeMultiplier + summary.holidayHours * baseRate * settings.holidayOvertimeMultiplier : summary.regularHours * baseRate + summary.weekdayOvertimeHours * baseRate * settings.weekdayOvertimeMultiplier + summary.holidayHours * baseRate * settings.holidayOvertimeMultiplier;
   const records = employee.rows.map((r) => `<tr><td>${r.type === 'clock_in' ? '<span class="in">上班</span>' : '<span class="out">下班</span>'}<form id="edit-${r.id}" method="post" action="/admin/attendance/edit"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${r.id}"></form></td><td><input form="edit-${r.id}" type="datetime-local" name="occurredAt" value="${r.occurred_at.slice(0,16).replace(' ','T')}" required></td><td><input form="edit-${r.id}" name="note" value="${escapeHtml(r.note || '')}" maxlength="100"></td><td>${r.source === 'admin' ? '補登' : 'LINE'}</td><td><button form="edit-${r.id}">修改</button><form method="post" action="/admin/attendance/delete" onsubmit="return confirm('確定刪除？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${r.id}"><button class="danger">刪除</button></form></td></tr>`).join('');
-  return `<article class="employee-card" data-name="${escapeHtml(employee.name.toLowerCase())}"><div class="employee"><div><h2>${escapeHtml(employee.name)}</h2><small>LINE：${escapeHtml(employee.display_name)}</small></div><div class="employee-actions"><form method="post" action="/admin/employee/name"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input name="name" value="${escapeHtml(employee.custom_name || '')}" placeholder="公司使用姓名"><button>儲存姓名</button></form><form method="post" action="/admin/employee/approval" onsubmit="return confirm('確定停用此員工？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><button class="danger" name="approved" value="0">停用</button></form></div></div>
-    <div class="stats five"><b>${summary.shifts}<small>出勤天數</small></b><b>${summary.hours.toFixed(2)}<small>總工時</small></b><b class="${summary.late ? 'warn' : ''}">${summary.late}<small>遲到次數</small></b><b>${summary.overtime.toFixed(2)}<small>加班時數</small></b><b class="${summary.incomplete ? 'warn' : ''}">${summary.incomplete}<small>未配對</small></b></div>
+  return `<article class="employee-card" data-name="${escapeHtml(`${employee.name} ${employee.employee_no} ${employee.department}`.toLowerCase())}"><div class="employee"><div><h2>${escapeHtml(employee.name)}</h2><small>${escapeHtml(employee.employee_no || '未設定員工編號')} · ${escapeHtml(employee.department || '未設定部門')} · LINE：${escapeHtml(employee.display_name)}</small></div><div class="employee-actions"><button type="button" class="secondary" onclick="document.getElementById('profile-${escapeHtml(employee.line_user_id)}').toggleAttribute('hidden')">員工資料／薪資</button><form method="post" action="/admin/employee/approval" onsubmit="return confirm('確定停用此員工？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><button class="danger" name="approved" value="0">停用</button></form></div></div>
+    <form id="profile-${escapeHtml(employee.line_user_id)}" class="profile-form" method="post" action="/admin/employee/profile" hidden><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><label>公司姓名<input name="name" value="${escapeHtml(employee.custom_name || '')}" maxlength="50"></label><label>員工編號<input name="employeeNo" value="${escapeHtml(employee.employee_no || '')}" maxlength="30"></label><label>部門<input name="department" value="${escapeHtml(employee.department || '')}" maxlength="50"></label><label>到職日<input type="date" name="hireDate" value="${escapeHtml(employee.hire_date || '')}"></label><label>離職日<input type="date" name="terminationDate" value="${escapeHtml(employee.termination_date || '')}"></label><label>薪資類型<select name="salaryType"><option value="hourly" ${employee.salary_type === 'hourly' ? 'selected' : ''}>時薪</option><option value="monthly" ${employee.salary_type === 'monthly' ? 'selected' : ''}>月薪</option></select></label><label>時薪<input type="number" name="hourlyRate" value="${Number(employee.hourly_rate || 0)}" min="0" step="1"></label><label>月薪<input type="number" name="monthlySalary" value="${Number(employee.monthly_salary || 0)}" min="0" step="1"></label><button>儲存員工資料</button></form>
+    <div class="stats six"><b>${summary.shifts}<small>出勤天數</small></b><b>${summary.hours.toFixed(2)}<small>計薪工時</small></b><b class="${summary.late ? 'warn' : ''}">${summary.late}<small>遲到</small></b><b class="${summary.early ? 'warn' : ''}">${summary.early}<small>早退</small></b><b>${summary.overtime.toFixed(2)}<small>加班工時</small></b><b>$${Math.round(estimatedPay).toLocaleString('zh-TW')}<small>預估薪資</small></b></div>
     <div class="table-wrap"><table><thead><tr><th>類型</th><th>時間</th><th>備註</th><th>來源</th><th></th></tr></thead><tbody>${records || '<tr><td colspan="5">本月無紀錄</td></tr>'}</tbody></table></div></article>`;
 }
 
 app.post('/admin/employee/name', requireAdmin, requireCsrf, (req, res) => {
   db.prepare('UPDATE employees SET custom_name=? WHERE line_user_id=?').run(String(req.body.name || '').trim().slice(0, 50), req.body.userId);
+  audit('修改姓名', 'employee', req.body.userId, String(req.body.name || ''));
+  res.redirect(303, '/admin');
+});
+app.post('/admin/employee/profile', requireAdmin, requireCsrf, (req, res) => {
+  const date = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value || '') ? value : '';
+  const salaryType = req.body.salaryType === 'monthly' ? 'monthly' : 'hourly';
+  db.prepare(`UPDATE employees SET custom_name=?,employee_no=?,department=?,hire_date=?,termination_date=?,salary_type=?,hourly_rate=?,monthly_salary=? WHERE line_user_id=?`)
+    .run(String(req.body.name || '').trim().slice(0, 50), String(req.body.employeeNo || '').trim().slice(0, 30), String(req.body.department || '').trim().slice(0, 50), date(req.body.hireDate), date(req.body.terminationDate), salaryType, Math.max(0, Number(req.body.hourlyRate) || 0), Math.max(0, Number(req.body.monthlySalary) || 0), req.body.userId);
+  audit('修改員工與薪資資料', 'employee', req.body.userId, `編號=${String(req.body.employeeNo || '').slice(0, 30)}；部門=${String(req.body.department || '').slice(0, 50)}；薪資類型=${salaryType}`);
   res.redirect(303, '/admin');
 });
 app.post('/admin/employee/approval', requireAdmin, requireCsrf, async (req, res) => {
@@ -421,19 +488,27 @@ app.post('/admin/employee/approval', requireAdmin, requireCsrf, async (req, res)
   } else if (req.body.approved === '0') {
     db.prepare('UPDATE employees SET approved=0 WHERE line_user_id=?').run(userId);
   }
+  audit(req.body.approved === '1' ? '核准員工' : req.body.approved === '0' ? '停用員工' : '移除申請', 'employee', userId);
   res.redirect(303, '/admin');
 });
 app.post('/admin/settings', requireAdmin, requireCsrf, (req, res) => {
   if (!/^\d{2}:\d{2}$/.test(req.body.shiftStart || '')) return res.status(400).send('上班時間格式錯誤');
   const lateGrace = Math.max(0, Math.min(120, Number(req.body.lateGrace)));
   const standardHours = Math.max(1, Math.min(24, Number(req.body.standardHours)));
+  const breakMinutes = Math.max(0, Math.min(480, Number(req.body.breakMinutes) || 0));
+  const weekdayOvertimeMultiplier = Math.max(1, Math.min(5, Number(req.body.weekdayOvertimeMultiplier) || 1));
+  const holidayOvertimeMultiplier = Math.max(1, Math.min(5, Number(req.body.holidayOvertimeMultiplier) || 1));
   const save = db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
   const transaction = db.transaction(() => {
     save.run('shift_start', req.body.shiftStart);
     save.run('late_grace_minutes', String(lateGrace));
     save.run('standard_hours', String(standardHours));
+    save.run('break_minutes', String(breakMinutes));
+    save.run('weekday_overtime_multiplier', String(weekdayOvertimeMultiplier));
+    save.run('holiday_overtime_multiplier', String(holidayOvertimeMultiplier));
   });
   transaction();
+  audit('修改出勤與薪資設定', 'settings', 'attendance', JSON.stringify({ shiftStart: req.body.shiftStart, lateGrace, standardHours, breakMinutes, weekdayOvertimeMultiplier, holidayOvertimeMultiplier }));
   res.redirect(303, '/admin');
 });
 app.post('/admin/schedule', requireAdmin, requireCsrf, (req, res) => {
@@ -441,10 +516,13 @@ app.post('/admin/schedule', requireAdmin, requireCsrf, (req, res) => {
   db.prepare(`INSERT INTO schedules(line_user_id,work_date,start_time,end_time,note) VALUES (?,?,?,?,?)
     ON CONFLICT(line_user_id,work_date) DO UPDATE SET start_time=excluded.start_time,end_time=excluded.end_time,note=excluded.note`)
     .run(req.body.userId, req.body.workDate, req.body.startTime, req.body.endTime, String(req.body.note || '').slice(0, 100));
+  audit('新增或更新班表', 'schedule', `${req.body.userId}|${req.body.workDate}`, `${req.body.startTime}-${req.body.endTime}`);
   res.redirect(303, '/admin');
 });
 app.post('/admin/schedule/delete', requireAdmin, requireCsrf, (req, res) => {
+  const before = db.prepare('SELECT * FROM schedules WHERE id=?').get(Number(req.body.id));
   db.prepare('DELETE FROM schedules WHERE id=?').run(Number(req.body.id));
+  if (before) audit('刪除班表', 'schedule', before.id, JSON.stringify(before));
   const returnTo = String(req.body.returnTo || '');
   res.redirect(303, returnTo.startsWith('/admin/schedules') ? returnTo : '/admin');
 });
@@ -453,6 +531,7 @@ app.post('/admin/leave/status', requireAdmin, requireCsrf, async (req, res) => {
   const leave = db.prepare('SELECT * FROM leave_requests WHERE id=?').get(Number(req.body.id));
   if (leave) {
     db.prepare('UPDATE leave_requests SET status=? WHERE id=?').run(req.body.status, leave.id);
+    audit(req.body.status === 'approved' ? '核准請假' : '駁回請假', 'leave', leave.id, `${leave.leave_date} ${leave.reason}`);
     const label = req.body.status === 'approved' ? '已核准 ✅' : '已駁回 ❌';
     try { await client.pushMessage({ to: leave.line_user_id, messages: [{ type: 'text', text: `你的請假申請${label}\n日期：${leave.leave_date}\n原因：${leave.reason}` }] }); } catch (error) { console.error('請假通知發送失敗', error.message); }
   }
@@ -461,16 +540,21 @@ app.post('/admin/leave/status', requireAdmin, requireCsrf, async (req, res) => {
 app.post('/admin/attendance/add', requireAdmin, requireCsrf, (req, res) => {
   if (!['clock_in', 'clock_out'].includes(req.body.type) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(req.body.occurredAt || '')) return res.status(400).send('資料格式錯誤');
   const occurredAt = `${req.body.occurredAt.replace('T', ' ')}:00`;
-  db.prepare('INSERT INTO attendance(line_user_id,type,occurred_at,source,note) VALUES (?,?,?,?,?)').run(req.body.userId, req.body.type, occurredAt, 'admin', String(req.body.note || '').slice(0, 100));
+  const result = db.prepare('INSERT INTO attendance(line_user_id,type,occurred_at,source,note) VALUES (?,?,?,?,?)').run(req.body.userId, req.body.type, occurredAt, 'admin', String(req.body.note || '').slice(0, 100));
+  audit('補登打卡', 'attendance', result.lastInsertRowid, `${req.body.type} ${occurredAt}`);
   res.redirect(303, `/admin?month=${encodeURIComponent(req.body.month || monthPrefix())}`);
 });
 app.post('/admin/attendance/edit', requireAdmin, requireCsrf, (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(req.body.occurredAt || '')) return res.status(400).send('時間格式錯誤');
+  const before = db.prepare('SELECT * FROM attendance WHERE id=?').get(Number(req.body.id));
   db.prepare('UPDATE attendance SET occurred_at=?,note=?,source=? WHERE id=?').run(`${req.body.occurredAt.replace('T', ' ')}:00`, String(req.body.note || '').slice(0, 100), 'admin', Number(req.body.id));
+  audit('修改打卡', 'attendance', req.body.id, JSON.stringify(before || {}));
   res.redirect(303, '/admin');
 });
 app.post('/admin/attendance/delete', requireAdmin, requireCsrf, (req, res) => {
+  const before = db.prepare('SELECT * FROM attendance WHERE id=?').get(Number(req.body.id));
   db.prepare('DELETE FROM attendance WHERE id=?').run(Number(req.body.id));
+  if (before) audit('刪除打卡', 'attendance', req.body.id, JSON.stringify(before));
   res.redirect(303, '/admin');
 });
 app.get('/admin/backup', requireAdmin, (_req, res) => {
@@ -492,7 +576,7 @@ app.get('/admin/export', requireAdmin, (req, res) => {
 });
 
 function summarize(rows, settings = getSettings()) {
-  let open = null; let hours = 0; let overtime = 0; let late = 0; let incomplete = 0; const days = new Set();
+  let open = null; let hours = 0; let overtime = 0; let late = 0; let early = 0; let incomplete = 0; let regularHours = 0; let weekdayOvertimeHours = 0; let holidayHours = 0; const days = new Set();
   for (const row of rows) {
     if (row.type === 'clock_in') {
       if (open) incomplete += 1;
@@ -501,17 +585,37 @@ function summarize(rows, settings = getSettings()) {
       const threshold = toMillis(`${row.occurred_at.slice(0, 10)} ${scheduled?.start_time || settings.shiftStart}:00`) + settings.lateGrace * 60000;
       if (toMillis(row.occurred_at) > threshold) late += 1;
     }
-    else if (open) { const duration = (toMillis(row.occurred_at) - toMillis(open.occurred_at)) / 3600000; if (duration >= 0 && duration <= 24) { hours += duration; overtime += Math.max(0, duration - settings.standardHours); days.add(open.occurred_at.slice(0, 10)); } else incomplete += 2; open = null; }
+    else if (open) {
+      const duration = (toMillis(row.occurred_at) - toMillis(open.occurred_at)) / 3600000;
+      if (duration >= 0 && duration <= 24) {
+        const net = Math.max(0, duration - settings.breakMinutes / 60);
+        const weekday = new Date(`${open.occurred_at.slice(0, 10)}T12:00:00+08:00`).getUTCDay();
+        hours += net;
+        if (weekday === 0 || weekday === 6) holidayHours += net;
+        else { regularHours += Math.min(net, settings.standardHours); weekdayOvertimeHours += Math.max(0, net - settings.standardHours); }
+        overtime = weekdayOvertimeHours + holidayHours;
+        days.add(open.occurred_at.slice(0, 10));
+        if (open.line_user_id) {
+          const scheduled = db.prepare('SELECT start_time,end_time FROM schedules WHERE line_user_id=? AND work_date=?').get(open.line_user_id, open.occurred_at.slice(0, 10));
+          if (scheduled) {
+            let scheduledEndDate = open.occurred_at.slice(0, 10);
+            if (scheduled.end_time <= scheduled.start_time) scheduledEndDate = addDays(scheduledEndDate, 1);
+            if (toMillis(row.occurred_at) < toMillis(`${scheduledEndDate} ${scheduled.end_time}:00`)) early += 1;
+          }
+        }
+      } else incomplete += 2;
+      open = null;
+    }
     else incomplete += 1;
   }
   if (open) incomplete += 1;
-  return { shifts: days.size, hours, late, overtime, incomplete };
+  return { shifts: days.size, hours, late, early, overtime, incomplete, regularHours, weekdayOvertimeHours, holidayHours };
 }
 function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function csvCell(value) { return `"${String(value).replace(/"/g, '""')}"`; }
 function page(title, body) {
   return `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title><style>
-  :root{font-family:Inter,"Noto Sans TC",system-ui;color:#18201d;background:#f2f5f3;scroll-behavior:smooth}*{box-sizing:border-box}body{margin:0}header{background:linear-gradient(135deg,#063d2d,#087f5b);color:white;padding:32px max(5vw,20px);display:flex;justify-content:space-between;align-items:center}h1,h2,h3,p{margin:0}header p{opacity:.75;margin-top:5px}nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#06c755;text-decoration:none}header a{color:white}.section-nav{position:sticky;top:0;z-index:20;background:#ffffffed;backdrop-filter:blur(12px);padding:12px max(5vw,20px);box-shadow:0 3px 14px #133b2c10;overflow:auto;flex-wrap:nowrap}.section-nav a{color:#315046;background:#edf7f2;border-radius:999px;padding:8px 14px;white-space:nowrap}.today,.pending-box,.toolbar,.operations,.employee-filter,.cards{max-width:1100px;margin:22px auto;padding:0 18px}.today{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.today div{background:white;border-radius:16px;padding:20px;box-shadow:0 3px 18px #133b2c12;border:1px solid #e8efeb}.today b{display:block;font-size:30px;color:#087f5b}.today span{font-size:13px;color:#68766f}.pending-box{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:18px}.pending-box h2 span{background:#c2410c;color:white;border-radius:20px;padding:2px 9px;font-size:14px}.pending-person{display:flex;justify-content:space-between;gap:15px;align-items:center;padding:13px 0;border-top:1px solid #fed7aa}.pending-person:first-of-type{margin-top:12px}.pending-person small{display:block;color:#78716c}.section-heading span,.employee-filter span,.panel-title span{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#087f5b}.section-heading h2,.employee-filter h2,.panel-title h2{margin-top:3px}.toolbar,.operations{display:grid;gap:12px}.toolbar form,article,.login{background:white;padding:18px;border-radius:16px;box-shadow:0 3px 18px #133b2c12}form{display:flex;gap:10px;align-items:end;flex-wrap:wrap}label{display:grid;gap:5px;font-size:13px;color:#52615b}input,select,button{font:inherit;padding:9px 11px;border:1px solid #ccd5d1;border-radius:9px;background:white}input:focus,select:focus{outline:2px solid #a7dcc8;border-color:#087f5b}button{background:#087f5b;color:white;border:0;cursor:pointer}.operations article{padding:0;scroll-margin-top:75px}.operations h2,.operations>article>form{padding:18px}.employee-filter{display:flex;align-items:end;justify-content:space-between;gap:18px;scroll-margin-top:75px}.employee-filter input{min-width:260px}.cards{display:grid;gap:18px}article{padding:0;overflow:hidden;border:1px solid #e8efeb}.employee{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:20px}.employee small{color:#77827e}.employee-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.stats{display:grid;background:#f6faf8;text-align:center}.stats.five{grid-template-columns:repeat(5,1fr)}.stats b{padding:15px;font-size:22px}.stats small{display:block;font-weight:400;font-size:12px;color:#68766f}.warn,.status-rejected{color:#c2410c}.status-approved{color:#087f5b}.status-pending{color:#a16207}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{text-align:left;padding:11px 16px;border-top:1px solid #edf0ee;font-size:14px}th{color:#52615b;background:#fbfdfc}td:last-child{display:flex;gap:6px;align-items:center}.in{color:#087f5b}.out{color:#2563eb}.danger{background:#fff;color:#c2410c;border:1px solid #fed7aa;padding:6px 9px}.login{max-width:380px;margin:12vh auto}.login form{margin-top:20px;display:grid}.empty{text-align:center;padding:40px;color:#66736e}[hidden]{display:none!important}
+  :root{font-family:Inter,"Noto Sans TC",system-ui;color:#18201d;background:#f2f5f3;scroll-behavior:smooth}*{box-sizing:border-box}body{margin:0}header{background:linear-gradient(135deg,#063d2d,#087f5b);color:white;padding:32px max(5vw,20px);display:flex;justify-content:space-between;align-items:center}h1,h2,h3,p{margin:0}header p{opacity:.75;margin-top:5px}nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#06c755;text-decoration:none}header a{color:white}.section-nav{position:sticky;top:0;z-index:20;background:#ffffffed;backdrop-filter:blur(12px);padding:12px max(5vw,20px);box-shadow:0 3px 14px #133b2c10;overflow:auto;flex-wrap:nowrap}.section-nav a{color:#315046;background:#edf7f2;border-radius:999px;padding:8px 14px;white-space:nowrap}.today,.pending-box,.toolbar,.operations,.employee-filter,.cards{max-width:1100px;margin:22px auto;padding:0 18px}.today{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.today div{background:white;border-radius:16px;padding:20px;box-shadow:0 3px 18px #133b2c12;border:1px solid #e8efeb}.today b{display:block;font-size:30px;color:#087f5b}.today span{font-size:13px;color:#68766f}.pending-box{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:18px}.pending-box h2 span{background:#c2410c;color:white;border-radius:20px;padding:2px 9px;font-size:14px}.pending-person{display:flex;justify-content:space-between;gap:15px;align-items:center;padding:13px 0;border-top:1px solid #fed7aa}.pending-person:first-of-type{margin-top:12px}.pending-person small{display:block;color:#78716c}.section-heading span,.employee-filter span,.panel-title span{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#087f5b}.section-heading h2,.employee-filter h2,.panel-title h2{margin-top:3px}.toolbar,.operations{display:grid;gap:12px}.toolbar form,article,.login{background:white;padding:18px;border-radius:16px;box-shadow:0 3px 18px #133b2c12}form{display:flex;gap:10px;align-items:end;flex-wrap:wrap}label{display:grid;gap:5px;font-size:13px;color:#52615b}input,select,button{font:inherit;padding:9px 11px;border:1px solid #ccd5d1;border-radius:9px;background:white}input:focus,select:focus{outline:2px solid #a7dcc8;border-color:#087f5b}button{background:#087f5b;color:white;border:0;cursor:pointer}.operations article{padding:0;scroll-margin-top:75px}.operations h2,.operations>article>form{padding:18px}.employee-filter{display:flex;align-items:end;justify-content:space-between;gap:18px;scroll-margin-top:75px}.employee-filter input{min-width:260px}.cards{display:grid;gap:18px}article{padding:0;overflow:hidden;border:1px solid #e8efeb}.employee{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:20px}.employee small{color:#77827e}.employee-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.profile-form{padding:16px 20px;background:#f8fbf9;border-top:1px solid #e4ebe7}.stats{display:grid;background:#f6faf8;text-align:center}.stats.five{grid-template-columns:repeat(5,1fr)}.stats.six{grid-template-columns:repeat(6,1fr)}.stats b{padding:15px;font-size:22px}.stats small{display:block;font-weight:400;font-size:12px;color:#68766f}.warn,.status-rejected{color:#c2410c}.status-approved{color:#087f5b}.status-pending{color:#a16207}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{text-align:left;padding:11px 16px;border-top:1px solid #edf0ee;font-size:14px}th{color:#52615b;background:#fbfdfc}td:last-child{display:flex;gap:6px;align-items:center}.in{color:#087f5b}.out{color:#2563eb}.danger{background:#fff;color:#c2410c;border:1px solid #fed7aa;padding:6px 9px}.login{max-width:380px;margin:12vh auto}.login form{margin-top:20px;display:grid}.empty{text-align:center;padding:40px;color:#66736e}[hidden]{display:none!important}.standalone{max-width:1200px;margin:24px auto;padding:0 18px}.standalone article{padding:18px}.standalone article .table-wrap{margin:18px -18px -18px}.audit-details{max-width:430px;white-space:normal;word-break:break-word}.issue-summary{display:flex;align-items:center;gap:12px;background:white;border-radius:16px;padding:18px;border:1px solid #e8efeb}.issue-summary b{font-size:32px;color:#c2410c}.issue-list{display:grid;gap:12px;margin-top:16px}.issue{display:grid;grid-template-columns:1fr auto;gap:7px;padding:18px;border-left:5px solid #f0b429}.issue.high{border-left-color:#c2410c}.issue span{font-size:11px;color:#9a6700}.issue.high span{color:#c2410c}.issue p{grid-column:1/-1;color:#66736e}.all-clear{background:#eaf9f1;color:#087f5b;border-radius:16px;padding:30px;text-align:center;font-size:18px}
   .schedule-page{max-width:1400px;margin:22px auto;padding:0 18px 50px}.schedule-toolbar{display:flex;justify-content:space-between;align-items:end;gap:14px;background:white;border:1px solid #e8efeb;border-radius:16px;padding:14px 18px;box-shadow:0 3px 18px #133b2c12}.schedule-tools{display:flex;gap:8px;align-items:center}.nav-button{background:#edf7f2;color:#087f5b;border-radius:9px;padding:10px 14px;white-space:nowrap}.secondary{background:#fff;color:#087f5b;border:1px solid #b9d9cc}.schedule-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.schedule-summary div{background:white;border:1px solid #e8efeb;border-radius:14px;padding:16px}.schedule-summary b{display:block;color:#087f5b;font-size:25px}.schedule-summary span{color:#68766f;font-size:12px}.schedule-controls{display:flex;justify-content:space-between;gap:12px;align-items:end;background:white;border:1px solid #e8efeb;border-radius:14px;padding:13px 16px;margin-bottom:12px}.week-grid{display:grid;grid-template-columns:repeat(7,minmax(165px,1fr));gap:10px;overflow:auto;padding-bottom:8px}.schedule-day{min-height:275px;padding:0;background:white}.schedule-day.is-today{border:2px solid #06c755}.schedule-day.understaffed{border-color:#f0b429}.day-head{display:flex;justify-content:space-between;align-items:center;padding:15px;background:#f6faf8;border-bottom:1px solid #e8efeb}.is-today .day-head{background:#eaf9f1}.day-head span{font-size:12px;color:#68766f}.day-head h3{margin-top:3px}.day-head>b{color:#087f5b;font-size:22px}.day-head small{font-size:11px;margin-left:2px}.staff-warning{background:#fff7db;color:#8a5d00;padding:6px 10px;text-align:center;font-size:12px}.day-shifts{padding:8px}.shift-row{display:flex;justify-content:space-between;gap:5px;border-bottom:1px solid #edf0ee;padding:10px 4px}.shift-row>div{min-width:0}.shift-row b,.shift-row span{display:block}.shift-row span{color:#66736e;font-size:12px;margin-top:3px}.shift-row em{display:inline-block;color:#b42318;background:#fff0ed;border-radius:99px;font-size:11px;font-style:normal;padding:2px 7px;margin-top:5px}.shift-row.conflict{background:#fff8f6}.shift-row form{align-self:start}.icon-danger{padding:0;background:transparent;color:#b42318;font-size:22px;line-height:1}.no-shift{padding:20px 4px;color:#929c98;font-size:13px;text-align:center}.leave-only{color:#9a6700;background:#fff8db;border-radius:7px;padding:7px;margin:5px 0;font-size:12px}.workload{background:white;border:1px solid #e8efeb;border-radius:16px;margin-top:18px;overflow:hidden}.workload .panel-title{padding:18px}.schedule-actions{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-top:18px}.schedule-actions article{padding:20px}.schedule-actions .muted{color:#66736e;line-height:1.6;margin:12px 0 18px}.bulk-form{display:grid;margin-top:18px}.bulk-form fieldset{border:1px solid #dde6e2;border-radius:12px;padding:14px;min-width:0}.bulk-form legend{font-weight:700;padding:0 7px}.people-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check-person{display:flex;align-items:center;border:1px solid #e2e8e5;border-radius:9px;padding:9px;background:#fbfdfc}.check-person input,.weekday-checks input,.skip-leave input{accent-color:#087f5b}.form-row,.weekday-checks{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.weekday-checks{margin-top:12px}.weekday-checks label,.skip-leave{display:flex;align-items:center;gap:4px}.skip-leave{margin-top:12px;color:#315046}.grow{flex:1}.grow input{width:100%}.primary-wide{width:100%;padding:12px;font-weight:700}
   @media(max-width:900px){.week-grid{grid-template-columns:repeat(7,190px)}.schedule-actions{grid-template-columns:1fr}.people-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){header{align-items:flex-start;gap:15px;flex-direction:column}.employee,.pending-person,.employee-filter{align-items:flex-start;flex-direction:column}.employee-filter input{width:100%;min-width:0}.stats.five{grid-template-columns:repeat(2,1fr)}.stats b{font-size:18px}.today{grid-template-columns:1fr 1fr 1fr;padding:0 12px}.today div{padding:14px}.today b{font-size:22px}.today span{font-size:11px}.schedule-toolbar,.schedule-controls{align-items:stretch;flex-direction:column}.schedule-toolbar .nav-button{text-align:center}.schedule-tools{display:grid;grid-template-columns:1fr 1fr 1fr}.schedule-summary{grid-template-columns:1fr 1fr}.people-grid{grid-template-columns:1fr}.form-row>label{width:100%}.form-row input{width:100%}}@media print{header,.schedule-toolbar,.schedule-controls,.schedule-actions,.icon-danger{display:none!important}.schedule-page{max-width:none;margin:0;padding:0}.week-grid{grid-template-columns:repeat(7,1fr);overflow:visible}.schedule-day{min-height:240px;box-shadow:none}.workload{break-before:page}.shift-row{font-size:10px}}
   </style>${body}</html>`;
