@@ -27,14 +27,19 @@
 
 管理後台支援：
 
-- 安全登入與 30 天登入狀態
+- owner／manager／viewer 多管理員角色與 30 天安全登入狀態
 - 自訂員工在公司的顯示姓名
-- 每人每月出勤天數、總工時與未配對紀錄
-- 管理員補登、備註與刪除錯誤紀錄
-- 月報表 CSV 匯出
-- 未來 30 天排班建立、更新與刪除
+- 員工核准、停權、員工編號、部門、到離職日與薪資資料
+- 每人每月出勤、工時、遲到、早退與未配對紀錄
+- 管理員補登、修改及刪除，並保存完整稽核紀錄
+- CSV、Excel 薪資報表與每月自動產生
+- 週班表、批次排班、班別模板、複製上週與人力警示
 - 依個人排班時間判斷遲到
 - 請假申請核准／駁回，並由 LINE 自動通知員工
+- 多據點 GPS 圍欄、員工定位同意與定位資料自動到期
+- 國定假日及個別倍率設定
+- 忘記下班、未依排班與連續打卡的主管 LINE 通知
+- 每日資料庫備份、手動備份與保存期限
 
 ## LINE Developers 設定
 
@@ -45,4 +50,15 @@
 5. Webhook URL 設為 `https://你的網域/webhook`，按 Verify 並啟用 Use webhook。
 6. 關閉 LINE 官方帳號內建的自動回覆，避免一次收到兩則訊息。
 
-資料儲存在 `data/attendance.db`。正式使用前，建議設定定期備份。
+資料預設儲存在 `data/attendance.db`，可用 `DATA_DIR` 指定永久磁碟路徑。系統每日 03:00 自動備份，並可在 `/admin/backups` 手動建立或下載備份。正式環境必須把 `/data` 掛載到主機的永久磁碟。
+
+## 正式部署必要設定
+
+- `DATA_DIR=/data`、`BACKUP_DIR=/data/backups`、`REPORT_DIR=/data/reports`
+- Render 掛載 Persistent Disk 到 `/data`（免費方案不支援永久磁碟，重新部署可能遺失 SQLite 資料）
+- 後台「GPS 據點」至少建立一個啟用據點，才可開啟強制定位
+- 後台設定主管 LINE User ID，才會收到異常與月報通知
+- 管理員需向員工提供 `/privacy` 隱私說明；員工輸入「同意定位」後才可 GPS 打卡
+- 上線前執行 `npm run check && npm test && npm audit --omit=dev`
+
+詳細交付檢查請見 [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md)。
