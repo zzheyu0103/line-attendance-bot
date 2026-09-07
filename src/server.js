@@ -307,7 +307,8 @@ function payrollFor(employee, records, settings = getSettings()) {
   return { ...summary, hourlyRate, regularPay, weekdayOvertimePay, holidayPay, totalPay: regularPay + weekdayOvertimePay + holidayPay };
 }
 
-async function ensureEmployee(userId) {
+async function ensureEmployee(userId, { autoApprove = false } = {}) {
+  const existing = db.prepare('SELECT line_user_id,approved FROM employees WHERE line_user_id=?').get(userId);
   let displayName = '未命名員工';
   try {
     const profile = await client.getProfile(userId);
@@ -316,6 +317,8 @@ async function ensureEmployee(userId) {
   db.prepare(`INSERT INTO employees(line_user_id, display_name, created_at)
     VALUES (?, ?, ?) ON CONFLICT(line_user_id) DO UPDATE SET display_name=excluded.display_name`)
     .run(userId, displayName, taipeiDate());
+  // 新好友第一次加入時自動建立員工；已被管理員停權的既有員工不會因重新加好友而復權。
+  if (autoApprove && !existing) db.prepare('UPDATE employees SET approved=1 WHERE line_user_id=?').run(userId);
   return db.prepare('SELECT COALESCE(NULLIF(custom_name,\'\'), display_name) AS name,approved,gps_consent_at FROM employees WHERE line_user_id=?').get(userId);
 }
 
@@ -334,6 +337,8 @@ function replyText(replyToken, text) {
     { type: 'action', action: { type: 'message', label: '下班', text: '下班' } },
     { type: 'action', action: { type: 'message', label: '今日', text: '今日' } },
     { type: 'action', action: { type: 'message', label: '班表', text: '班表' } },
+    { type: 'action', action: { type: 'message', label: '請假', text: '請假' } },
+    { type: 'action', action: { type: 'message', label: '我的請假', text: '我的請假' } },
   ] } }] }));
 }
 
@@ -345,8 +350,19 @@ function requestLocation(replyToken, text) {
 }
 
 async function handleMessage(event) {
-  if (event.type !== 'message' || !event.source.userId) return;
+  if (!event.source?.userId) return;
   const userId = event.source.userId;
+  if (event.type === 'follow') {
+    const employee = await ensureEmployee(userId, { autoApprove: true });
+    audit('LINE好友自動建立員工', 'employee', userId, 'follow event', `LINE:${userId}`);
+    return lineCall(() => client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `👋 ${employee.name}，已完成員工身分建立，可以直接使用下方功能打卡。`, quickReply: { items: [
+      { type: 'action', action: { type: 'message', label: '上班', text: '上班' } },
+      { type: 'action', action: { type: 'message', label: '下班', text: '下班' } },
+      { type: 'action', action: { type: 'message', label: '請假', text: '請假' } },
+      { type: 'action', action: { type: 'message', label: '我的請假', text: '我的請假' } },
+    ] } }] }));
+  }
+  if (event.type !== 'message') return;
   const employee = await ensureEmployee(userId);
   const name = employee.name;
   if (!employee.approved) return replyText(event.replyToken, `👋 ${name}，你的員工申請已建立。\n請等待管理員在後台核准後再使用打卡功能。`);
@@ -445,6 +461,7 @@ async function handleMessage(event) {
   }
 
   const leaveMatch = rawCommand.match(/^請假\s+(\d{4}-\d{2}-\d{2})\s+(.{1,100})$/);
+  if (command === '請假') return replyText(event.replyToken, '請輸入：請假 YYYY-MM-DD 原因\n例如：請假 2026-09-10 家庭事務');
   if (leaveMatch) {
     if (leaveMatch[1] < dayPrefix()) return replyText(event.replyToken, '請假日期不可早於今天。');
     db.prepare('INSERT INTO leave_requests(line_user_id,leave_date,reason,status,created_at) VALUES (?,?,?,?,?)').run(userId, leaveMatch[1], leaveMatch[2], 'pending', taipeiDate());
@@ -473,6 +490,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 });
 
 app.use(express.urlencoded({ extended: false }));
+app.use('/admin', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); res.setHeader('Pragma', 'no-cache'); next(); });
 const csrfValue = crypto.createHmac('sha256', process.env.ADMIN_PASSWORD).update('csrf').digest('hex');
 const sessionSecret = crypto.createHmac('sha256', process.env.ADMIN_PASSWORD).update('line-attendance-session-v2').digest();
 function cookies(req) {
@@ -708,7 +726,7 @@ async function createPayrollWorkbook(month) {
   });
   const rules = workbook.addWorksheet('計算規則');
   const settings = getSettings();
-  rules.addRows([['項目', '設定值'], ['每日標準工時', settings.standardHours], ['休息分鐘', settings.breakMinutes], ['平日加班倍率', settings.weekdayOvertimeMultiplier], ['假日倍率', settings.holidayOvertimeMultiplier], ['產生時間', taipeiDate()], ['說明', '本報表為預估結果，正式發薪前請確認異常與未配對紀錄。']]);
+  rules.addRows([['項目', '設定值'], ['每日標準工時', settings.standardHours], ['休息分鐘（計薪、不扣除）', settings.breakMinutes], ['平日加班倍率', settings.weekdayOvertimeMultiplier], ['假日倍率', settings.holidayOvertimeMultiplier], ['產生時間', taipeiDate()], ['說明', '本報表為預估結果，正式發薪前請確認異常與未配對紀錄。']]);
   rules.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
   rules.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF087F5B' } };
   rules.columns = [{ width: 24 }, { width: 60 }];
@@ -724,7 +742,7 @@ app.get('/admin/payroll', requireAdmin, (req, res) => {
   const totalHours = rows.reduce((sum, row) => sum + row.payroll.hours, 0);
   const totalPay = rows.reduce((sum, row) => sum + row.payroll.totalPay, 0);
   const tableRows = rows.map(({ employee, payroll }) => `<tr><td><b>${escapeHtml(employee.name)}</b><small>${escapeHtml(employee.employee_no || '未設定編號')} · ${escapeHtml(employee.department || '未設定部門')}</small></td><td>${employee.salary_type === 'monthly' ? '月薪' : '時薪'}</td><td>${payroll.regularHours.toFixed(2)}</td><td>${payroll.weekdayOvertimeHours.toFixed(2)}</td><td>${payroll.holidayHours.toFixed(2)}</td><td>${payroll.late}</td><td>${payroll.early}</td><td>$${Math.round(payroll.totalPay).toLocaleString('zh-TW')}</td></tr>`).join('');
-  res.send(page('薪資中心', `<header><div><h1>薪資中心</h1><p>${month} 預估薪資</p></div><nav><a href="/admin">返回出勤管理</a><a href="/admin/payroll/export?month=${month}">匯出 CSV</a><a href="/admin/payroll/excel?month=${month}">下載 Excel</a><a href="/admin/reports">自動報表</a><a href="/admin/holidays">假日設定</a></nav></header><main class="standalone payroll-page"><section class="payroll-toolbar"><form method="get"><label>薪資月份<input type="month" name="month" value="${month}"></label><button>查詢</button></form><button class="secondary" onclick="window.print()">列印薪資表</button></section><section class="schedule-summary"><div><b>${rows.length}</b><span>計薪員工</span></div><div><b>${totalHours.toFixed(1)}</b><span>總計薪工時</span></div><div><b>$${Math.round(totalPay).toLocaleString('zh-TW')}</b><span>預估薪資總額</span></div><div><b>${rows.reduce((sum, row) => sum + row.payroll.incomplete, 0)}</b><span>未配對紀錄</span></div></section><article><div class="table-wrap"><table class="payroll-table"><thead><tr><th>員工</th><th>薪資制</th><th>正常工時</th><th>平日加班</th><th>假日工時</th><th>遲到</th><th>早退</th><th>預估薪資</th></tr></thead><tbody>${tableRows || '<tr><td colspan="8">本月尚無員工資料</td></tr>'}</tbody></table></div></article><p class="payroll-note">預估金額依目前設定的休息時間、國定假日及加班倍率計算，正式發薪前仍應由管理員確認未配對與異常紀錄。</p></main>`));
+  res.send(page('薪資中心', `<header><div><h1>薪資中心</h1><p>${month} 預估薪資</p></div><nav><a href="/admin">返回出勤管理</a><a href="/admin/payroll/export?month=${month}">匯出 CSV</a><a href="/admin/payroll/excel?month=${month}">下載 Excel</a><a href="/admin/reports">自動報表</a><a href="/admin/holidays">假日設定</a></nav></header><main class="standalone payroll-page"><section class="payroll-toolbar"><form method="get"><label>薪資月份<input type="month" name="month" value="${month}"></label><button>查詢</button></form><button class="secondary" onclick="window.print()">列印薪資表</button></section><section class="schedule-summary"><div><b>${rows.length}</b><span>計薪員工</span></div><div><b>${totalHours.toFixed(1)}</b><span>總計薪工時</span></div><div><b>$${Math.round(totalPay).toLocaleString('zh-TW')}</b><span>預估薪資總額</span></div><div><b>${rows.reduce((sum, row) => sum + row.payroll.incomplete, 0)}</b><span>未配對紀錄</span></div></section><article><div class="table-wrap"><table class="payroll-table"><thead><tr><th>員工</th><th>薪資制</th><th>正常工時</th><th>平日加班</th><th>假日工時</th><th>遲到</th><th>早退</th><th>預估薪資</th></tr></thead><tbody>${tableRows || '<tr><td colspan="8">本月尚無員工資料</td></tr>'}</tbody></table></div></article><p class="payroll-note">休息時間會計入薪資；金額另依國定假日及加班倍率計算，正式發薪前仍應由管理員確認未配對與異常紀錄。</p></main>`));
 });
 
 app.get('/admin/payroll/export', requireAdmin, (req, res) => {
@@ -791,7 +809,7 @@ app.get('/admin/employees', requireAdmin, (_req, res) => {
 
 app.get('/admin/settings', requireAdmin, requireOwner, (_req, res) => {
   const settings = getSettings();
-  res.send(page('系統設定中心', `<header><div><h1>系統設定</h1><p>出勤、通知與資料保存規則</p></div><nav><a href="/admin/locations">GPS 據點</a><a href="/admin/holidays">假日設定</a><a href="/admin/backups">備份中心</a><a href="/admin">返回出勤管理</a></nav></header><main class="standalone settings-page"><form class="settings-save" method="post" action="/admin/settings"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="returnTo" value="/admin/settings"><section class="settings-grid"><article><div class="panel-title"><span>Attendance</span><h2>出勤與薪資規則</h2></div><div class="settings-form"><label>標準上班時間<input type="time" name="shiftStart" value="${settings.shiftStart}" required></label><label>遲到寬限分鐘<input type="number" name="lateGrace" value="${settings.lateGrace}" min="0" max="120" required></label><label>每日標準工時<input type="number" name="standardHours" value="${settings.standardHours}" min="1" max="24" step="0.5" required></label><label>每日休息分鐘<input type="number" name="breakMinutes" value="${settings.breakMinutes}" min="0" max="480" required></label><label>平日加班倍率<input type="number" name="weekdayOvertimeMultiplier" value="${settings.weekdayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label><label>預設假日倍率<input type="number" name="holidayOvertimeMultiplier" value="${settings.holidayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label></div></article><article><div class="panel-title"><span>Notifications & privacy</span><h2>通知與個資</h2></div><div class="settings-form gps-settings"><label class="toggle"><input type="checkbox" name="gpsRequired" value="1" ${settings.gpsRequired ? 'checked' : ''}>所有 LINE 上下班都必須定位</label><label>主管 LINE User ID<input name="supervisorLineIds" value="${escapeHtml(settings.supervisorLineIds.join(','))}" placeholder="多筆以逗號分隔"><small>用於異常與月報通知</small></label><label>定位保存天數<input type="number" name="locationRetentionDays" value="${settings.locationRetentionDays}" min="1" max="3650" required></label><label>隱私聯絡窗口<input name="privacyContact" value="${escapeHtml(settings.privacyContact)}" maxlength="100" placeholder="電話或 Email"></label><p class="gps-help">座標與範圍請到獨立的「GPS 據點」管理；員工首次使用前必須在 LINE 輸入「同意定位」。</p></div></article></section><button class="primary-wide settings-submit">儲存所有設定</button></form><section class="system-card"><div class="panel-title"><span>System centers</span><h2>獨立管理功能</h2></div><div class="system-list"><div><b>GPS 據點</b><span><a href="/admin/locations">管理多個打卡範圍</a></span></div><div><b>國定假日</b><span><a href="/admin/holidays">管理假日計薪</a></span></div><div><b>自動報表</b><span><a href="/admin/reports">下載每月 Excel</a></span></div><div><b>管理員</b><span><a href="/admin/admins">帳號與權限</a></span></div><div><b>公開隱私說明</b><span><a href="/privacy" target="_blank">查看</a></span></div></div></section></main>`));
+  res.send(page('系統設定中心', `<header><div><h1>系統設定</h1><p>出勤、通知與資料保存規則</p></div><nav><a href="/admin/locations">GPS 據點</a><a href="/admin/holidays">假日設定</a><a href="/admin/backups">備份中心</a><a href="/admin">返回出勤管理</a></nav></header><main class="standalone settings-page"><form class="settings-save" method="post" action="/admin/settings"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="returnTo" value="/admin/settings"><section class="settings-grid"><article><div class="panel-title"><span>Attendance</span><h2>出勤與薪資規則</h2></div><div class="settings-form"><label>標準上班時間<input type="time" name="shiftStart" value="${settings.shiftStart}" required></label><label>遲到寬限分鐘<input type="number" name="lateGrace" value="${settings.lateGrace}" min="0" max="120" required></label><label>每日標準工時<input type="number" name="standardHours" value="${settings.standardHours}" min="1" max="24" step="0.5" required></label><label>休息分鐘（計薪、不扣除）<input type="number" name="breakMinutes" value="${settings.breakMinutes}" min="0" max="480" required></label><label>平日加班倍率<input type="number" name="weekdayOvertimeMultiplier" value="${settings.weekdayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label><label>預設假日倍率<input type="number" name="holidayOvertimeMultiplier" value="${settings.holidayOvertimeMultiplier}" min="1" max="5" step="0.01" required></label></div></article><article><div class="panel-title"><span>Notifications & privacy</span><h2>通知與個資</h2></div><div class="settings-form gps-settings"><label class="toggle"><input type="checkbox" name="gpsRequired" value="1" ${settings.gpsRequired ? 'checked' : ''}>所有 LINE 上下班都必須定位</label><label>主管 LINE User ID<input name="supervisorLineIds" value="${escapeHtml(settings.supervisorLineIds.join(','))}" placeholder="多筆以逗號分隔"><small>用於異常與月報通知</small></label><label>定位保存天數<input type="number" name="locationRetentionDays" value="${settings.locationRetentionDays}" min="1" max="3650" required></label><label>隱私聯絡窗口<input name="privacyContact" value="${escapeHtml(settings.privacyContact)}" maxlength="100" placeholder="電話或 Email"></label><p class="gps-help">座標與範圍請到獨立的「GPS 據點」管理；員工首次使用前必須在 LINE 輸入「同意定位」。</p></div></article></section><button class="primary-wide settings-submit">儲存所有設定</button></form><section class="system-card"><div class="panel-title"><span>System centers</span><h2>獨立管理功能</h2></div><div class="system-list"><div><b>GPS 據點</b><span><a href="/admin/locations">管理多個打卡範圍</a></span></div><div><b>國定假日</b><span><a href="/admin/holidays">管理假日計薪</a></span></div><div><b>自動報表</b><span><a href="/admin/reports">下載每月 Excel</a></span></div><div><b>管理員</b><span><a href="/admin/admins">帳號與權限</a></span></div><div><b>公開隱私說明</b><span><a href="/privacy" target="_blank">查看</a></span></div></div></section></main>`));
 });
 
 app.get('/admin/locations', requireAdmin, (req, res) => {
@@ -1063,7 +1081,8 @@ function summarize(rows, settings = getSettings()) {
     else if (open) {
       const duration = (toMillis(row.occurred_at) - toMillis(open.occurred_at)) / 3600000;
       if (duration >= 0 && duration <= 24) {
-        const net = Math.max(0, duration - settings.breakMinutes / 60);
+        // 休息時間仍屬計薪時間；設定中的 breakMinutes 只供排班與報表參考，不扣除工時。
+        const net = duration;
         const workDate = open.occurred_at.slice(0, 10);
         const holiday = db.prepare('SELECT multiplier FROM holidays WHERE work_date=?').get(workDate);
         hours += net;
