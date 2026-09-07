@@ -182,18 +182,25 @@ const requestedBranchLocations = [
   { name: '拿靠早午餐｜林口遠雄仁愛店', latitude: 25.078439011741, longitude: 121.373255002021 },
 ];
 function seedRequestedBranchLocations() {
-  if (db.prepare("SELECT value FROM settings WHERE key='requested_branches_seeded'").get()?.value === '1') return false;
+  const seeded = db.prepare("SELECT value FROM settings WHERE key='requested_branches_seeded'").get()?.value === '1';
   const insert = db.prepare(`INSERT INTO work_locations(name,latitude,longitude,radius_meters,active,created_at) VALUES (?,?,?,?,1,?)`);
   const transaction = db.transaction(() => {
-    for (const location of requestedBranchLocations) {
-      if (!db.prepare('SELECT id FROM work_locations WHERE name=? LIMIT 1').get(location.name)) {
-        insert.run(location.name, location.latitude, location.longitude, 200, taipeiDate());
+    if (!seeded) {
+      for (const location of requestedBranchLocations) {
+        if (!db.prepare('SELECT id FROM work_locations WHERE name=? LIMIT 1').get(location.name)) {
+          insert.run(location.name, location.latitude, location.longitude, 500, taipeiDate());
+        }
       }
+      db.prepare("INSERT INTO settings(key,value) VALUES ('requested_branches_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'").run();
     }
-    db.prepare("INSERT INTO settings(key,value) VALUES ('requested_branches_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'").run();
+    // 這四個新加入的據點原先是 200 公尺；只升級仍為預設值的據點，保留管理員已自訂的範圍。
+    if (db.prepare("SELECT value FROM settings WHERE key='requested_branch_radius_500'").get()?.value !== '1') {
+      for (const location of requestedBranchLocations) db.prepare('UPDATE work_locations SET radius_meters=500 WHERE name=? AND radius_meters=200').run(location.name);
+      db.prepare("INSERT INTO settings(key,value) VALUES ('requested_branch_radius_500','1') ON CONFLICT(key) DO UPDATE SET value='1'").run();
+    }
   });
   transaction();
-  return true;
+  return !seeded;
 }
 seedRequestedBranchLocations();
 
@@ -1000,7 +1007,7 @@ app.get('/admin/settings', requireAdmin, requireOwner, (_req, res) => {
 
 app.get('/admin/locations', requireAdmin, (req, res) => {
   const locations = db.prepare('SELECT * FROM work_locations ORDER BY active DESC,name').all();
-  const rows = locations.map((location) => `<tr><td><b>${escapeHtml(location.name)}</b></td><td>${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}</td><td>${location.radius_meters} 公尺</td><td><span class="${location.active ? 'status-approved' : 'status-rejected'}">${location.active ? '啟用' : '停用'}</span></td><td><form method="post" action="/admin/locations/toggle"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${location.id}"><button class="${location.active ? 'danger' : ''}" name="active" value="${location.active ? 0 : 1}">${location.active ? '停用' : '啟用'}</button></form><form method="post" action="/admin/locations/delete" onsubmit="return confirm('確定刪除此據點？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${location.id}"><button class="danger">刪除</button></form></td></tr>`).join('');
+  const rows = locations.map((location) => `<tr><td><b>${escapeHtml(location.name)}</b></td><td>${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}</td><td><form method="post" action="/admin/locations/radius"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${location.id}"><input type="number" name="radius" value="${location.radius_meters}" min="20" max="10000" step="1" aria-label="${escapeHtml(location.name)} GPS 半徑"><span>公尺</span><button>儲存</button></form></td><td><span class="${location.active ? 'status-approved' : 'status-rejected'}">${location.active ? '啟用' : '停用'}</span></td><td><form method="post" action="/admin/locations/toggle"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${location.id}"><button class="${location.active ? 'danger' : ''}" name="active" value="${location.active ? 0 : 1}">${location.active ? '停用' : '啟用'}</button></form><form method="post" action="/admin/locations/delete" onsubmit="return confirm('確定刪除此據點？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="id" value="${location.id}"><button class="danger">刪除</button></form></td></tr>`).join('');
   res.send(page('GPS 據點管理', `<header><div><h1>GPS 據點</h1><p>員工可在任一啟用據點範圍內打卡</p></div><nav><a href="/admin/settings">系統設定</a><a href="/admin">返回出勤管理</a></nav></header><main class="standalone"><section class="payroll-toolbar"><form method="post" action="/admin/locations"><input type="hidden" name="csrf" value="${csrfValue}"><label>據點名稱<input name="name" maxlength="60" required></label><label>緯度<input type="number" name="latitude" min="-90" max="90" step="0.000001" required></label><label>經度<input type="number" name="longitude" min="-180" max="180" step="0.000001" required></label><label>允許半徑（公尺）<input type="number" name="radius" value="200" min="20" max="10000" required></label><button>新增據點</button></form></section><article><div class="table-wrap"><table><thead><tr><th>據點</th><th>座標</th><th>範圍</th><th>狀態</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="5">尚未設定據點；新增後才可使用定位打卡。</td></tr>'}</tbody></table></div></article></main>`));
 });
 app.post('/admin/locations', requireAdmin, requireCsrf, (req, res) => {
@@ -1010,6 +1017,17 @@ app.post('/admin/locations', requireAdmin, requireCsrf, (req, res) => {
   if (!name || !Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return res.status(400).send('據點資料格式錯誤');
   const result = db.prepare('INSERT INTO work_locations(name,latitude,longitude,radius_meters,active,created_at) VALUES (?,?,?,?,1,?)').run(name, latitude, longitude, radius, taipeiDate());
   audit('新增GPS據點', 'work_location', result.lastInsertRowid, name, req.admin.username); res.redirect(303, '/admin/locations');
+});
+app.post('/admin/locations/radius', requireAdmin, requireCsrf, (req, res) => {
+  const id = Number(req.body.id);
+  const requestedRadius = Number(req.body.radius);
+  if (!Number.isInteger(id) || !Number.isFinite(requestedRadius) || requestedRadius < 20) return res.status(400).send('GPS 範圍格式錯誤');
+  const radius = Math.min(10000, requestedRadius);
+  const location = db.prepare('SELECT name,radius_meters FROM work_locations WHERE id=?').get(id);
+  if (!location) return res.status(404).send('找不到 GPS 據點');
+  db.prepare('UPDATE work_locations SET radius_meters=? WHERE id=?').run(radius, id);
+  audit('修改GPS據點範圍', 'work_location', id, `${location.name}：${location.radius_meters}m → ${radius}m`, req.admin.username);
+  res.redirect(303, '/admin/locations');
 });
 app.post('/admin/locations/toggle', requireAdmin, requireCsrf, (req, res) => {
   db.prepare('UPDATE work_locations SET active=? WHERE id=?').run(req.body.active === '1' ? 1 : 0, Number(req.body.id));
