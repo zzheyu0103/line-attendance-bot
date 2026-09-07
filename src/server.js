@@ -95,6 +95,12 @@ db.exec(`
     created_at TEXT NOT NULL,
     FOREIGN KEY(line_user_id) REFERENCES employees(line_user_id)
   );
+  CREATE TABLE IF NOT EXISTS pending_leave_requests (
+    line_user_id TEXT PRIMARY KEY,
+    leave_date TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    FOREIGN KEY(line_user_id) REFERENCES employees(line_user_id)
+  );
   CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     actor TEXT NOT NULL,
@@ -420,6 +426,20 @@ function requestLocation(replyToken, text) {
   ] } }] }));
 }
 
+function replyLeaveDatePicker(replyToken) {
+  const today = dayPrefix();
+  return lineCall(() => client.replyMessage({ replyToken, messages: [{
+    type: 'template',
+    altText: '請選擇請假日期',
+    template: {
+      type: 'buttons',
+      title: '請假申請',
+      text: '請點選下方按鈕選擇日期',
+      actions: [{ type: 'datetimepicker', label: '選擇請假日期', data: 'action=leave_date', mode: 'date', initial: today, min: today, max: addDays(today, 365) }],
+    },
+  }] }));
+}
+
 async function handleMessage(event) {
   if (!event.source?.userId) return;
   const userId = event.source.userId;
@@ -432,6 +452,19 @@ async function handleMessage(event) {
       { type: 'action', action: { type: 'message', label: '請假', text: '請假' } },
       { type: 'action', action: { type: 'message', label: '我的請假', text: '我的請假' } },
     ] } }] }));
+  }
+  if (event.type === 'postback') {
+    const action = new URLSearchParams(event.postback?.data || '').get('action');
+    if (action === 'leave_date') {
+      const leaveDate = event.postback?.params?.date || '';
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(leaveDate) || leaveDate < dayPrefix() || leaveDate > addDays(dayPrefix(), 365)) {
+        return replyText(event.replyToken, '請選擇今天起 365 天內的請假日期。');
+      }
+      db.prepare(`INSERT INTO pending_leave_requests(line_user_id,leave_date,requested_at) VALUES (?,?,?)
+        ON CONFLICT(line_user_id) DO UPDATE SET leave_date=excluded.leave_date,requested_at=excluded.requested_at`).run(userId, leaveDate, taipeiDate());
+      return replyText(event.replyToken, `已選擇請假日期：${leaveDate}\n請直接回覆請假原因（最多 100 字）。\n若要重新選日期，請輸入「請假」。`);
+    }
+    return;
   }
   if (event.type !== 'message') return;
   const employee = await ensureEmployee(userId);
@@ -476,6 +509,10 @@ async function handleMessage(event) {
   if (command === '取消定位') {
     db.prepare('DELETE FROM pending_location_clock WHERE line_user_id=?').run(userId);
     return replyText(event.replyToken, '已取消這次定位打卡。');
+  }
+  if (command === '取消請假' || command === '取消') {
+    db.prepare('DELETE FROM pending_leave_requests WHERE line_user_id=?').run(userId);
+    return replyText(event.replyToken, '已取消這次請假申請。');
   }
 
   if (['上班', '打卡上班', '定位上班', '下班', '打卡下班', '定位下班'].includes(command) && (getSettings().gpsRequired || command.startsWith('定位'))) {
@@ -531,12 +568,28 @@ async function handleMessage(event) {
     return replyText(event.replyToken, `📆 ${name} 未來 7 天班表\n${text}`);
   }
 
+  const leaveDateOnly = rawCommand.match(/^請假\s+(\d{4}-\d{2}-\d{2})$/);
   const leaveMatch = rawCommand.match(/^請假\s+(\d{4}-\d{2}-\d{2})\s+(.{1,100})$/);
-  if (command === '請假') return replyText(event.replyToken, '請輸入：請假 YYYY-MM-DD 原因\n例如：請假 2026-09-10 家庭事務');
+  if (command === '請假') return replyLeaveDatePicker(event.replyToken);
+  if (leaveDateOnly) {
+    if (leaveDateOnly[1] < dayPrefix() || leaveDateOnly[1] > addDays(dayPrefix(), 365)) return replyText(event.replyToken, '請假日期須為今天起 365 天內。');
+    db.prepare(`INSERT INTO pending_leave_requests(line_user_id,leave_date,requested_at) VALUES (?,?,?)
+      ON CONFLICT(line_user_id) DO UPDATE SET leave_date=excluded.leave_date,requested_at=excluded.requested_at`).run(userId, leaveDateOnly[1], taipeiDate());
+    return replyText(event.replyToken, `已選擇請假日期：${leaveDateOnly[1]}\n請直接回覆請假原因（最多 100 字）。`);
+  }
   if (leaveMatch) {
     if (leaveMatch[1] < dayPrefix()) return replyText(event.replyToken, '請假日期不可早於今天。');
     db.prepare('INSERT INTO leave_requests(line_user_id,leave_date,reason,status,created_at) VALUES (?,?,?,?,?)').run(userId, leaveMatch[1], leaveMatch[2], 'pending', taipeiDate());
     return replyText(event.replyToken, `📝 請假申請已送出\n日期：${leaveMatch[1]}\n原因：${leaveMatch[2]}\n請等待管理員審核。`);
+  }
+  const pendingLeave = db.prepare('SELECT leave_date,requested_at FROM pending_leave_requests WHERE line_user_id=?').get(userId);
+  if (pendingLeave && (toMillis(taipeiDate()) - toMillis(pendingLeave.requested_at)) > 30 * 60000) {
+    db.prepare('DELETE FROM pending_leave_requests WHERE line_user_id=?').run(userId);
+  }
+  if (pendingLeave && (toMillis(taipeiDate()) - toMillis(pendingLeave.requested_at)) <= 30 * 60000 && command !== '我的請假' && rawCommand.length >= 1 && rawCommand.length <= 100) {
+    db.prepare('INSERT INTO leave_requests(line_user_id,leave_date,reason,status,created_at) VALUES (?,?,?,?,?)').run(userId, pendingLeave.leave_date, rawCommand, 'pending', taipeiDate());
+    db.prepare('DELETE FROM pending_leave_requests WHERE line_user_id=?').run(userId);
+    return replyText(event.replyToken, `📝 請假申請已送出\n日期：${pendingLeave.leave_date}\n原因：${rawCommand}\n請等待管理員審核。`);
   }
 
   if (command === '我的請假') {
@@ -1184,6 +1237,29 @@ function page(title, body) {
   :root{font-family:Inter,"Noto Sans TC",system-ui;color:#18201d;background:#f2f5f3;scroll-behavior:smooth}*{box-sizing:border-box}body{margin:0}header{background:linear-gradient(135deg,#063d2d,#087f5b);color:white;padding:32px max(5vw,20px);display:flex;justify-content:space-between;align-items:center}h1,h2,h3,p{margin:0}header p{opacity:.75;margin-top:5px}nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#06c755;text-decoration:none}header a{color:white}.section-nav{position:sticky;top:0;z-index:20;background:#ffffffed;backdrop-filter:blur(12px);padding:12px max(5vw,20px);box-shadow:0 3px 14px #133b2c10;overflow:auto;flex-wrap:nowrap}.section-nav a{color:#315046;background:#edf7f2;border-radius:999px;padding:8px 14px;white-space:nowrap}.today,.pending-box,.toolbar,.operations,.employee-filter,.cards{max-width:1100px;margin:22px auto;padding:0 18px}.today{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.today.four{grid-template-columns:repeat(4,1fr)}.today div{background:white;border-radius:16px;padding:20px;box-shadow:0 3px 18px #133b2c12;border:1px solid #e8efeb}.today b{display:block;font-size:30px;color:#087f5b}.today span{font-size:13px;color:#68766f}.pending-box{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:18px}.pending-box h2 span{background:#c2410c;color:white;border-radius:20px;padding:2px 9px;font-size:14px}.pending-person{display:flex;justify-content:space-between;gap:15px;align-items:center;padding:13px 0;border-top:1px solid #fed7aa}.pending-person:first-of-type{margin-top:12px}.pending-person small{display:block;color:#78716c}.section-heading span,.employee-filter span,.panel-title span{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#087f5b}.section-heading h2,.employee-filter h2,.panel-title h2{margin-top:3px}.toolbar,.operations{display:grid;gap:12px}.toolbar form,article,.login{background:white;padding:18px;border-radius:16px;box-shadow:0 3px 18px #133b2c12}form{display:flex;gap:10px;align-items:end;flex-wrap:wrap}label{display:grid;gap:5px;font-size:13px;color:#52615b}input,select,button{font:inherit;padding:9px 11px;border:1px solid #ccd5d1;border-radius:9px;background:white}input:focus,select:focus{outline:2px solid #a7dcc8;border-color:#087f5b}button{background:#087f5b;color:white;border:0;cursor:pointer}.operations article{padding:0;scroll-margin-top:75px}.operations h2,.operations>article>form{padding:18px}.employee-filter{display:flex;align-items:end;justify-content:space-between;gap:18px;scroll-margin-top:75px}.employee-filter input{min-width:260px}.cards{display:grid;gap:18px}article{padding:0;overflow:hidden;border:1px solid #e8efeb}.employee{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:20px}.employee small{color:#77827e}.employee-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.profile-form{padding:16px 20px;background:#f8fbf9;border-top:1px solid #e4ebe7}.stats{display:grid;background:#f6faf8;text-align:center}.stats.five{grid-template-columns:repeat(5,1fr)}.stats.six{grid-template-columns:repeat(6,1fr)}.stats b{padding:15px;font-size:22px}.stats small{display:block;font-weight:400;font-size:12px;color:#68766f}.warn,.status-rejected{color:#c2410c}.status-approved{color:#087f5b}.status-pending{color:#a16207}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{text-align:left;padding:11px 16px;border-top:1px solid #edf0ee;font-size:14px}th{color:#52615b;background:#fbfdfc}td:last-child{display:flex;gap:6px;align-items:center}.leave-table td:nth-child(2) b,.leave-table td:nth-child(2) small{display:block}.leave-table td:nth-child(2) small{color:#77827e;margin-top:3px}.in{color:#087f5b}.out{color:#2563eb}.danger{background:#fff;color:#c2410c;border:1px solid #fed7aa;padding:6px 9px}.login{max-width:380px;margin:12vh auto}.login form{margin-top:20px;display:grid}.empty{text-align:center;padding:40px;color:#66736e}[hidden]{display:none!important}.standalone{max-width:1200px;margin:24px auto;padding:0 18px}.standalone article{padding:18px}.standalone article .table-wrap{margin:18px -18px -18px}.audit-details{max-width:430px;white-space:normal;word-break:break-word}.issue-summary{display:flex;align-items:center;gap:12px;background:white;border-radius:16px;padding:18px;border:1px solid #e8efeb}.issue-summary b{font-size:32px;color:#c2410c}.issue-list{display:grid;gap:12px;margin-top:16px}.issue{display:grid;grid-template-columns:1fr auto;gap:7px;padding:18px;border-left:5px solid #f0b429}.issue.high{border-left-color:#c2410c}.issue span{font-size:11px;color:#9a6700}.issue.high span{color:#c2410c}.issue p{grid-column:1/-1;color:#66736e}.all-clear{background:#eaf9f1;color:#087f5b;border-radius:16px;padding:30px;text-align:center;font-size:18px}.approval-section{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:18px;margin-bottom:18px}.approval-card{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px 0;border:0;border-top:1px solid #fed7aa;border-radius:0;box-shadow:none;background:transparent}.approval-card:first-of-type{margin-top:14px}.approval-card span,.staff-title span,.staff-toolbar span{font-size:12px;color:#087f5b}.approval-card small,.staff-title small{color:#77827e}.staff-toolbar{display:flex;justify-content:space-between;align-items:end;margin:18px 0}.staff-toolbar input{min-width:280px}.staff-grid{display:grid;gap:16px}.staff-card{padding:0}.staff-title{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:18px}.employee-center-form{display:grid;grid-template-columns:repeat(4,1fr);align-items:end}.employee-center-form button{height:40px}
   .schedule-page{max-width:1400px;margin:22px auto;padding:0 18px 50px}.schedule-toolbar{display:flex;justify-content:space-between;align-items:end;gap:14px;background:white;border:1px solid #e8efeb;border-radius:16px;padding:14px 18px;box-shadow:0 3px 18px #133b2c12}.schedule-tools{display:flex;gap:8px;align-items:center}.nav-button{background:#edf7f2;color:#087f5b;border-radius:9px;padding:10px 14px;white-space:nowrap}.secondary{background:#fff;color:#087f5b;border:1px solid #b9d9cc}.schedule-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.schedule-summary div{background:white;border:1px solid #e8efeb;border-radius:14px;padding:16px}.schedule-summary b{display:block;color:#087f5b;font-size:25px}.schedule-summary span{color:#68766f;font-size:12px}.schedule-controls{display:flex;justify-content:space-between;gap:12px;align-items:end;background:white;border:1px solid #e8efeb;border-radius:14px;padding:13px 16px;margin-bottom:12px}.week-grid{display:grid;grid-template-columns:repeat(7,minmax(165px,1fr));gap:10px;overflow:auto;padding-bottom:8px}.schedule-day{min-height:275px;padding:0;background:white}.schedule-day.is-today{border:2px solid #06c755}.schedule-day.understaffed{border-color:#f0b429}.day-head{display:flex;justify-content:space-between;align-items:center;padding:15px;background:#f6faf8;border-bottom:1px solid #e8efeb}.is-today .day-head{background:#eaf9f1}.day-head span{font-size:12px;color:#68766f}.day-head h3{margin-top:3px}.day-head>b{color:#087f5b;font-size:22px}.day-head small{font-size:11px;margin-left:2px}.staff-warning{background:#fff7db;color:#8a5d00;padding:6px 10px;text-align:center;font-size:12px}.day-shifts{padding:8px}.shift-row{display:flex;justify-content:space-between;gap:5px;border-bottom:1px solid #edf0ee;padding:10px 4px}.shift-row>div{min-width:0}.shift-row b,.shift-row span{display:block}.shift-row span{color:#66736e;font-size:12px;margin-top:3px}.shift-row em{display:inline-block;color:#b42318;background:#fff0ed;border-radius:99px;font-size:11px;font-style:normal;padding:2px 7px;margin-top:5px}.shift-row.conflict{background:#fff8f6}.shift-row form{align-self:start}.icon-danger{padding:0;background:transparent;color:#b42318;font-size:22px;line-height:1}.no-shift{padding:20px 4px;color:#929c98;font-size:13px;text-align:center}.leave-only{color:#9a6700;background:#fff8db;border-radius:7px;padding:7px;margin:5px 0;font-size:12px}.workload{background:white;border:1px solid #e8efeb;border-radius:16px;margin-top:18px;overflow:hidden}.workload .panel-title{padding:18px}.schedule-actions{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-top:18px}.schedule-actions article{padding:20px}.schedule-actions .muted{color:#66736e;line-height:1.6;margin:12px 0 18px}.bulk-form{display:grid;margin-top:18px}.bulk-form fieldset{border:1px solid #dde6e2;border-radius:12px;padding:14px;min-width:0}.bulk-form legend{font-weight:700;padding:0 7px}.people-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check-person{display:flex;align-items:center;border:1px solid #e2e8e5;border-radius:9px;padding:9px;background:#fbfdfc}.check-person input,.weekday-checks input,.skip-leave input{accent-color:#087f5b}.form-row,.weekday-checks{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.weekday-checks{margin-top:12px}.weekday-checks label,.skip-leave{display:flex;align-items:center;gap:4px}.skip-leave{margin-top:12px;color:#315046}.grow{flex:1}.grow input{width:100%}.primary-wide{width:100%;padding:12px;font-weight:700}.template-manager{border-top:1px solid #e2e8e5;margin-top:24px;padding-top:20px}.template-list{display:grid;gap:7px;margin:14px 0}.template-card{display:flex;justify-content:space-between;align-items:center;background:#f6faf8;border-radius:9px;padding:9px 12px}.template-card span{display:block;color:#66736e;font-size:12px;margin-top:2px}.template-form{display:grid;grid-template-columns:1fr 1fr}.template-form button{grid-column:1/-1}.payroll-toolbar{display:flex;justify-content:space-between;align-items:end;background:white;border:1px solid #e8efeb;border-radius:14px;padding:14px 18px}.payroll-table td:first-child b,.payroll-table td:first-child small{display:block}.payroll-table td:first-child small{color:#77827e;margin-top:3px}.payroll-table td:last-child{font-weight:700;color:#087f5b}.payroll-note{color:#66736e;font-size:13px;line-height:1.6;margin-top:14px}.settings-save{display:block}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.settings-grid article,.system-card{padding:20px}.settings-form{display:grid;grid-template-columns:1fr 1fr;margin-top:20px}.settings-form label small{color:#86918c}.gps-settings .toggle{grid-column:1/-1;display:flex;align-items:center;gap:8px;background:#edf7f2;border-radius:10px;padding:12px}.gps-settings .toggle input{accent-color:#087f5b}.gps-help{grid-column:1/-1;color:#66736e;font-size:12px;line-height:1.5}.settings-submit{margin:16px 0}.system-card{background:white;border:1px solid #e8efeb;border-radius:16px}.system-list{display:grid;margin:18px 0}.system-list div{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-bottom:1px solid #e8efeb}.system-list span{text-align:right;color:#66736e}.backup-button{display:block;text-align:center;background:#087f5b;color:white;border-radius:9px;padding:11px}.data-warning{background:#fff7ed;color:#9a3412;border-radius:10px;padding:12px;margin-top:13px;font-size:12px;line-height:1.5}
   @media(max-width:900px){.week-grid{grid-template-columns:repeat(7,190px)}.schedule-actions,.settings-grid{grid-template-columns:1fr}.people-grid{grid-template-columns:repeat(2,1fr)}.employee-center-form{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){header{align-items:flex-start;gap:15px;flex-direction:column}.employee,.pending-person,.employee-filter,.approval-card,.staff-title,.staff-toolbar{align-items:flex-start;flex-direction:column}.employee-filter input,.staff-toolbar input{width:100%;min-width:0}.employee-center-form,.settings-form,.template-form{grid-template-columns:1fr}.settings-form button,.template-form button{grid-column:auto}.stats.five{grid-template-columns:repeat(2,1fr)}.stats b{font-size:18px}.today{grid-template-columns:1fr 1fr 1fr;padding:0 12px}.today.four{grid-template-columns:1fr 1fr}.today div{padding:14px}.today b{font-size:22px}.today span{font-size:11px}.schedule-toolbar,.schedule-controls,.payroll-toolbar{align-items:stretch;flex-direction:column}.schedule-toolbar .nav-button{text-align:center}.schedule-tools{display:grid;grid-template-columns:1fr 1fr 1fr}.schedule-summary{grid-template-columns:1fr 1fr}.people-grid{grid-template-columns:1fr}.form-row>label{width:100%}.form-row input{width:100%}}@media print{header,.schedule-toolbar,.schedule-controls,.schedule-actions,.icon-danger,.payroll-toolbar,.payroll-note{display:none!important}.schedule-page,.standalone{max-width:none;margin:0;padding:0}.week-grid{grid-template-columns:repeat(7,1fr);overflow:visible}.schedule-day{min-height:240px;box-shadow:none}.workload{break-before:page}.shift-row{font-size:10px}}
+  </style><style>
+  /* 後台粉色主題 */
+  body{background:#fff5f8;color:#4a2935}
+  header{background:linear-gradient(135deg,#8d2f55,#d94f83)}
+  a{color:#c73770}
+  header a{color:#fff}
+  .section-nav{background:#fff8fbf2;box-shadow:0 3px 14px #8d2f5518}
+  .section-nav a{color:#9b3b60;background:#ffe4ee}
+  .today div,.toolbar form,article,.login,.schedule-toolbar,.schedule-summary div,.schedule-controls,.workload,.system-card{border-color:#f4d7e2;box-shadow:0 3px 18px #8d2f5514}
+  .today b,.section-heading span,.employee-filter span,.panel-title span,.approval-card span,.staff-title span,.staff-toolbar span,.schedule-summary b{color:#c73770}
+  .today span,.employee small,.stats small,.payroll-note,.gps-help{color:#806773}
+  .pending-box,.approval-section{background:#fff0f5;border-color:#f1bfd2}
+  .pending-box h2 span{background:#c73770}
+  input:focus,select:focus{outline-color:#f2a9c2;border-color:#d94f83}
+  button{background:#d94f83}
+  .nav-button{background:#ffe4ee;color:#a02f5d}
+  .secondary{background:#fff;color:#c73770;border-color:#eab0c6}
+  .danger{background:#fff;color:#c73770;border-color:#f1bfd2}
+  .profile-form,.stats,.day-head,.template-card{background:#fff8fb}
+  .is-today .day-head{background:#ffeaf2}
+  .schedule-day.is-today{border-color:#d94f83}
+  .data-warning{background:#fff0f5;color:#9f315d}
+  .all-clear{background:#fff0f5;color:#b5366b}
   </style>${body}</html>`;
 }
 
