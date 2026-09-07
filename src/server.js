@@ -472,11 +472,7 @@ async function handleMessage(event) {
     const employee = await ensureEmployee(userId, { autoApprove: true });
     audit('LINE好友自動建立員工', 'employee', userId, 'follow event', `LINE:${userId}`);
     const locations = branchLocations();
-    if (!employee.work_location_id && locations.length > 1) return replyBranchPicker(event.replyToken, locations);
-    if (!employee.work_location_id && locations.length === 1) {
-      db.prepare('UPDATE employees SET work_location_id=? WHERE line_user_id=?').run(locations[0].id, userId);
-      employee.work_location_id = locations[0].id;
-    }
+    if (!employee.work_location_id && locations.length) return replyBranchPicker(event.replyToken, locations);
     const branch = locations.find((location) => Number(location.id) === Number(employee.work_location_id));
     return replyWelcome(event.replyToken, employee.name, branch?.name || '');
   }
@@ -509,12 +505,7 @@ async function handleMessage(event) {
   if (!employee.approved) return replyText(event.replyToken, `👋 ${name}，你的員工申請已建立。\n請等待管理員在後台核准後再使用打卡功能。`);
   const locations = branchLocations();
   let branch = locations.find((location) => Number(location.id) === Number(employee.work_location_id));
-  if (!branch && locations.length > 1) return replyBranchPicker(event.replyToken, locations);
-  if (!branch && locations.length === 1) {
-    db.prepare('UPDATE employees SET work_location_id=? WHERE line_user_id=?').run(locations[0].id, userId);
-    employee.work_location_id = locations[0].id;
-    branch = locations[0];
-  }
+  if (!branch && locations.length) return replyBranchPicker(event.replyToken, locations);
   const last = lastRecord(userId);
 
   if (event.message.type === 'location') {
