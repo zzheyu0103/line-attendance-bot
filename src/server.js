@@ -2,9 +2,11 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const express = require('express');
 const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const line = require('@line/bot-sdk');
 const ExcelJS = require('exceljs');
 const { taipeiDate, toMillis, addDays, distanceMeters, shiftHours } = require('./utils');
@@ -17,6 +19,7 @@ if (missing.length) {
 }
 
 const app = express();
+app.use((_req, res, next) => { res.on('finish', queueRemoteSnapshot); next(); });
 const port = Number(process.env.PORT || 3000);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const backupDir = path.resolve(process.env.BACKUP_DIR || path.join(dataDir, 'backups'));
@@ -24,7 +27,8 @@ const reportDir = path.resolve(process.env.REPORT_DIR || path.join(dataDir, 'rep
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(backupDir, { recursive: true });
 fs.mkdirSync(reportDir, { recursive: true });
-const db = new Database(path.join(dataDir, 'attendance.db'));
+const dbFile = path.join(dataDir, 'attendance.db');
+let db = new Database(dbFile);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.exec(`
@@ -134,7 +138,7 @@ db.exec(`
     multiplier REAL NOT NULL DEFAULT 1.67
   );
 `);
-for (const sql of [
+const migrationSql = [
   'ALTER TABLE employees ADD COLUMN custom_name TEXT',
   "ALTER TABLE employees ADD COLUMN employee_no TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE employees ADD COLUMN department TEXT NOT NULL DEFAULT ''",
@@ -152,13 +156,80 @@ for (const sql of [
   'ALTER TABLE attendance ADD COLUMN work_location_id INTEGER',
   "ALTER TABLE attendance ADD COLUMN work_location_name TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE employees ADD COLUMN gps_consent_at TEXT NOT NULL DEFAULT ''",
-]) {
+];
+function applyDbMigrations() {
+  for (const sql of migrationSql) {
   try { db.exec(sql); } catch (error) { if (!/duplicate column/i.test(error.message)) throw error; }
+  }
+  let approvalColumnAdded = false;
+  try { db.exec('ALTER TABLE employees ADD COLUMN approved INTEGER NOT NULL DEFAULT 0'); approvalColumnAdded = true; }
+  catch (error) { if (!/duplicate column/i.test(error.message)) throw error; }
+  if (approvalColumnAdded) db.exec('UPDATE employees SET approved=1');
 }
-let approvalColumnAdded = false;
-try { db.exec('ALTER TABLE employees ADD COLUMN approved INTEGER NOT NULL DEFAULT 0'); approvalColumnAdded = true; }
-catch (error) { if (!/duplicate column/i.test(error.message)) throw error; }
-if (approvalColumnAdded) db.exec('UPDATE employees SET approved=1');
+applyDbMigrations();
+
+let remotePool = null;
+let remoteSnapshotTimer = null;
+let remoteSnapshotRunning = false;
+const remoteStateTable = `
+  CREATE TABLE IF NOT EXISTS attendance_sqlite_state (
+    id INTEGER PRIMARY KEY,
+    database_file BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+
+async function snapshotRemoteDatabase() {
+  if (!remotePool || remoteSnapshotRunning) return;
+  remoteSnapshotRunning = true;
+  const temporaryFile = path.join(os.tmpdir(), `attendance-remote-${process.pid}.db`);
+  try {
+    await db.backup(temporaryFile);
+    const databaseFile = fs.readFileSync(temporaryFile);
+    await remotePool.query(`INSERT INTO attendance_sqlite_state(id,database_file,updated_at) VALUES (1,$1,NOW()) ON CONFLICT(id) DO UPDATE SET database_file=EXCLUDED.database_file,updated_at=EXCLUDED.updated_at`, [databaseFile]);
+  } catch (error) {
+    console.error('Neon 資料庫快照失敗', error.message);
+  } finally {
+    remoteSnapshotRunning = false;
+    try { fs.unlinkSync(temporaryFile); } catch (_) {}
+  }
+}
+
+function queueRemoteSnapshot() {
+  if (shuttingDown || !remotePool || remoteSnapshotTimer) return;
+  remoteSnapshotTimer = setTimeout(() => {
+    remoteSnapshotTimer = null;
+    snapshotRemoteDatabase().catch((error) => console.error('Neon 快照排程失敗', error.message));
+  }, 5000);
+  remoteSnapshotTimer.unref();
+}
+
+async function initializeRemoteDatabase() {
+  if (!process.env.DATABASE_URL) return;
+  remotePool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
+    max: 2,
+  });
+  await remotePool.query(remoteStateTable);
+  const result = await remotePool.query('SELECT database_file FROM attendance_sqlite_state WHERE id=1');
+  const remoteFile = result.rows[0]?.database_file;
+  if (remoteFile && remoteFile.length) {
+    const temporaryFile = path.join(os.tmpdir(), `attendance-restore-${process.pid}.db`);
+    fs.writeFileSync(temporaryFile, remoteFile);
+    db.close();
+    for (const sidecar of [`${dbFile}-wal`, `${dbFile}-shm`]) { try { fs.unlinkSync(sidecar); } catch (_) {} }
+    fs.copyFileSync(temporaryFile, dbFile);
+    try { fs.unlinkSync(temporaryFile); } catch (_) {}
+    db = new Database(dbFile);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+    applyDbMigrations();
+    console.log('已從 Neon 還原 SQLite 資料庫');
+  } else {
+    await snapshotRemoteDatabase();
+    console.log('已將現有 SQLite 資料庫同步至 Neon');
+  }
+}
 
 const lineConfig = {
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -1116,6 +1187,48 @@ function page(title, body) {
   </style>${body}</html>`;
 }
 
-scheduleDailyBackup();
-scheduleOperations();
-app.listen(port, () => console.log(`LINE 打卡系統已啟動：http://localhost:${port}`));
+let httpServer = null;
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (remoteSnapshotTimer) {
+    clearTimeout(remoteSnapshotTimer);
+    remoteSnapshotTimer = null;
+  }
+  try {
+    // 若剛好有請求觸發快照，先等它完成，再做最後一次同步。
+    while (remoteSnapshotRunning) await sleep(100);
+    await snapshotRemoteDatabase();
+  } catch (error) {
+    console.error(`${signal} 關閉前同步 Neon 失敗`, error.message);
+  } finally {
+    try { if (remotePool) await remotePool.end(); } catch (error) { console.error('Neon 連線關閉失敗', error.message); }
+    try { if (db.open) db.close(); } catch (error) { console.error('SQLite 關閉失敗', error.message); }
+    if (httpServer) {
+      httpServer.close(() => process.exit(0));
+    } else {
+      process.exit(0);
+    }
+  }
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+
+async function start() {
+  try {
+    await initializeRemoteDatabase();
+    scheduleDailyBackup();
+    scheduleOperations();
+    httpServer = app.listen(port, () => console.log(`LINE 打卡系統已啟動：http://localhost:${port}`));
+  } catch (error) {
+    console.error('資料庫初始化失敗', error);
+    try { if (remotePool) await remotePool.end(); } catch (_) {}
+    try { if (db.open) db.close(); } catch (_) {}
+    process.exit(1);
+  }
+}
+
+start();

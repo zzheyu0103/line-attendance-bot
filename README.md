@@ -57,6 +57,8 @@
 
 - `DATA_DIR=/data`、`BACKUP_DIR=/data/backups`、`REPORT_DIR=/data/reports`
 - Render 掛載 Persistent Disk 到 `/data`（免費方案不支援永久磁碟，重新部署可能遺失 SQLite 資料）
+- 若使用 Render 免費方案，可在 Neon 建立 PostgreSQL 專案，將 Neon Connect 顯示的完整連線字串設為 `DATABASE_URL`，並設定 `DATABASE_SSL=true`。系統會在啟動時還原最新 SQLite 快照，資料異動後約 5 秒同步一次，停止服務前也會再同步一次。
+- Neon 備援目前以單一 `attendance_sqlite_state` 資料列保存最新快照，適用於單一 Render Web Service；不要同時啟動多個會寫入同一份資料的服務。
 - 後台「GPS 據點」至少建立一個啟用據點，才可開啟強制定位
 - 後台設定主管 LINE User ID，才會收到異常與月報通知
 - 管理員需向員工提供 `/privacy` 隱私說明；員工輸入「同意定位」後才可 GPS 打卡

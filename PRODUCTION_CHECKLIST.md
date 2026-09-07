@@ -7,6 +7,7 @@
 - [ ] Persistent Disk 掛載路徑為 `/data`
 - [ ] `DATA_DIR`、`BACKUP_DIR`、`REPORT_DIR` 都指向 `/data` 內
 - [ ] 從後台建立一次手動備份並實際下載開啟
+- [ ] 若使用 Neon 備援，Render 已設定 `DATABASE_URL` 與 `DATABASE_SSL=true`，且重啟後員工資料仍存在
 
 ## 權限與隱私
 
