@@ -175,6 +175,28 @@ function applyDbMigrations() {
 }
 applyDbMigrations();
 
+const requestedBranchLocations = [
+  { name: 'Big City遠東巨城購物中心', latitude: 24.81015820988118, longitude: 120.97516984837321 },
+  { name: '誠品生活南西', latitude: 25.052433277039, longitude: 121.520663509853 },
+  { name: '統一時代百貨 台北店', latitude: 25.040864616186, longitude: 121.565417005478 },
+  { name: '拿靠早午餐｜林口遠雄仁愛店', latitude: 25.078439011741, longitude: 121.373255002021 },
+];
+function seedRequestedBranchLocations() {
+  if (db.prepare("SELECT value FROM settings WHERE key='requested_branches_seeded'").get()?.value === '1') return false;
+  const insert = db.prepare(`INSERT INTO work_locations(name,latitude,longitude,radius_meters,active,created_at) VALUES (?,?,?,?,1,?)`);
+  const transaction = db.transaction(() => {
+    for (const location of requestedBranchLocations) {
+      if (!db.prepare('SELECT id FROM work_locations WHERE name=? LIMIT 1').get(location.name)) {
+        insert.run(location.name, location.latitude, location.longitude, 200, taipeiDate());
+      }
+    }
+    db.prepare("INSERT INTO settings(key,value) VALUES ('requested_branches_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'").run();
+  });
+  transaction();
+  return true;
+}
+seedRequestedBranchLocations();
+
 let remotePool = null;
 let remoteSnapshotTimer = null;
 let remoteSnapshotRunning = false;
@@ -231,6 +253,8 @@ async function initializeRemoteDatabase() {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     applyDbMigrations();
+    seedRequestedBranchLocations();
+    await snapshotRemoteDatabase();
     console.log('已從 Neon 還原 SQLite 資料庫');
   } else {
     await snapshotRemoteDatabase();
