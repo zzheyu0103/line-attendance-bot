@@ -146,6 +146,7 @@ db.exec(`
 `);
 const migrationSql = [
   'ALTER TABLE employees ADD COLUMN custom_name TEXT',
+  'ALTER TABLE employees ADD COLUMN work_location_id INTEGER',
   "ALTER TABLE employees ADD COLUMN employee_no TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE employees ADD COLUMN department TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE employees ADD COLUMN hire_date TEXT NOT NULL DEFAULT ''",
@@ -272,8 +273,13 @@ function activeLocations() {
   return settings.officeLatitude && settings.officeLongitude ? [{ id: null, name: '主要公司據點', latitude: settings.officeLatitude, longitude: settings.officeLongitude, radius_meters: settings.officeRadius }] : [];
 }
 
-function nearestLocation(latitude, longitude) {
-  return activeLocations().map((location) => ({ ...location, distance: distanceMeters(latitude, longitude, location.latitude, location.longitude) })).sort((a, b) => a.distance - b.distance)[0];
+function nearestLocation(latitude, longitude, workLocationId = null) {
+  let locations = activeLocations();
+  if (workLocationId) {
+    const selected = locations.filter((location) => Number(location.id) === Number(workLocationId));
+    if (selected.length) locations = selected;
+  }
+  return locations.map((location) => ({ ...location, distance: distanceMeters(latitude, longitude, location.latitude, location.longitude) })).sort((a, b) => a.distance - b.distance)[0];
 }
 
 function audit(action, targetType, targetId, details = '', actor = 'system') {
@@ -396,7 +402,26 @@ async function ensureEmployee(userId, { autoApprove = false } = {}) {
     .run(userId, displayName, taipeiDate());
   // 新好友第一次加入時自動建立員工；已被管理員停權的既有員工不會因重新加好友而復權。
   if (autoApprove && !existing) db.prepare('UPDATE employees SET approved=1 WHERE line_user_id=?').run(userId);
-  return db.prepare('SELECT COALESCE(NULLIF(custom_name,\'\'), display_name) AS name,approved,gps_consent_at FROM employees WHERE line_user_id=?').get(userId);
+  return db.prepare('SELECT COALESCE(NULLIF(custom_name,\'\'), display_name) AS name,approved,gps_consent_at,work_location_id FROM employees WHERE line_user_id=?').get(userId);
+}
+
+function branchLocations() {
+  return db.prepare('SELECT id,name FROM work_locations WHERE active=1 ORDER BY name').all();
+}
+
+function replyWelcome(replyToken, name, branchName = '') {
+  const branchText = branchName ? `\n分店：${branchName}` : '';
+  return lineCall(() => client.replyMessage({ replyToken, messages: [{ type: 'text', text: `👋 ${name}，已完成員工登入，可以直接使用下方功能打卡。${branchText}`, quickReply: { items: [
+    { type: 'action', action: { type: 'message', label: '上班', text: '上班' } },
+    { type: 'action', action: { type: 'message', label: '下班', text: '下班' } },
+    { type: 'action', action: { type: 'message', label: '請假', text: '請假' } },
+    { type: 'action', action: { type: 'message', label: '我的請假', text: '我的請假' } },
+  ] } }] }));
+}
+
+function replyBranchPicker(replyToken, locations) {
+  const items = locations.slice(0, 13).map((location) => ({ type: 'action', action: { type: 'postback', label: String(location.name).slice(0, 20), data: `action=select_branch&id=${location.id}`, displayText: `選擇分店：${location.name}` } }));
+  return lineCall(() => client.replyMessage({ replyToken, messages: [{ type: 'text', text: '請先選擇你所屬的分店，選擇後即可直接使用系統。', quickReply: { items } }] }));
 }
 
 function todayRecords(userId) {
@@ -446,15 +471,27 @@ async function handleMessage(event) {
   if (event.type === 'follow') {
     const employee = await ensureEmployee(userId, { autoApprove: true });
     audit('LINE好友自動建立員工', 'employee', userId, 'follow event', `LINE:${userId}`);
-    return lineCall(() => client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `👋 ${employee.name}，已完成員工身分建立，可以直接使用下方功能打卡。`, quickReply: { items: [
-      { type: 'action', action: { type: 'message', label: '上班', text: '上班' } },
-      { type: 'action', action: { type: 'message', label: '下班', text: '下班' } },
-      { type: 'action', action: { type: 'message', label: '請假', text: '請假' } },
-      { type: 'action', action: { type: 'message', label: '我的請假', text: '我的請假' } },
-    ] } }] }));
+    const locations = branchLocations();
+    if (!employee.work_location_id && locations.length > 1) return replyBranchPicker(event.replyToken, locations);
+    if (!employee.work_location_id && locations.length === 1) {
+      db.prepare('UPDATE employees SET work_location_id=? WHERE line_user_id=?').run(locations[0].id, userId);
+      employee.work_location_id = locations[0].id;
+    }
+    const branch = locations.find((location) => Number(location.id) === Number(employee.work_location_id));
+    return replyWelcome(event.replyToken, employee.name, branch?.name || '');
   }
   if (event.type === 'postback') {
     const action = new URLSearchParams(event.postback?.data || '').get('action');
+    if (action === 'select_branch') {
+      const employee = await ensureEmployee(userId);
+      if (!employee?.approved) return replyText(event.replyToken, '目前無法登入，請聯絡管理員確認員工狀態。');
+      const locationId = Number(new URLSearchParams(event.postback?.data || '').get('id'));
+      const location = db.prepare('SELECT id,name FROM work_locations WHERE id=? AND active=1').get(locationId);
+      if (!location) return replyBranchPicker(event.replyToken, branchLocations());
+      db.prepare('UPDATE employees SET work_location_id=? WHERE line_user_id=?').run(location.id, userId);
+      audit('員工選擇分店', 'employee', userId, location.name, `LINE:${userId}`);
+      return replyWelcome(event.replyToken, employee.name, location.name);
+    }
     if (action === 'leave_date') {
       const leaveDate = event.postback?.params?.date || '';
       if (!/^\d{4}-\d{2}-\d{2}$/.test(leaveDate) || leaveDate < dayPrefix() || leaveDate > addDays(dayPrefix(), 365)) {
@@ -470,6 +507,14 @@ async function handleMessage(event) {
   const employee = await ensureEmployee(userId);
   const name = employee.name;
   if (!employee.approved) return replyText(event.replyToken, `👋 ${name}，你的員工申請已建立。\n請等待管理員在後台核准後再使用打卡功能。`);
+  const locations = branchLocations();
+  let branch = locations.find((location) => Number(location.id) === Number(employee.work_location_id));
+  if (!branch && locations.length > 1) return replyBranchPicker(event.replyToken, locations);
+  if (!branch && locations.length === 1) {
+    db.prepare('UPDATE employees SET work_location_id=? WHERE line_user_id=?').run(locations[0].id, userId);
+    employee.work_location_id = locations[0].id;
+    branch = locations[0];
+  }
   const last = lastRecord(userId);
 
   if (event.message.type === 'location') {
@@ -480,7 +525,7 @@ async function handleMessage(event) {
     }
     const latitude = Number(event.message.latitude);
     const longitude = Number(event.message.longitude);
-    const location = nearestLocation(latitude, longitude);
+    const location = nearestLocation(latitude, longitude, employee.work_location_id);
     if (!location) return replyText(event.replyToken, '管理員尚未設定可用的 GPS 打卡據點。');
     if (location.distance > location.radius_meters) {
       audit('定位打卡遭拒', 'employee', userId, `最近據點=${location.name}；距離=${Math.round(location.distance)}m`, `LINE:${userId}`);
@@ -923,11 +968,13 @@ app.get('/admin/leaves', requireAdmin, (req, res) => {
 });
 
 app.get('/admin/employees', requireAdmin, (_req, res) => {
-  const employees = db.prepare(`SELECT *,COALESCE(NULLIF(custom_name,''),display_name) name FROM employees ORDER BY approved,name`).all();
+  const employees = db.prepare(`SELECT e.*,COALESCE(NULLIF(e.custom_name,''),e.display_name) name,COALESCE(w.name,'未選擇分店') work_location_name FROM employees e LEFT JOIN work_locations w ON w.id=e.work_location_id ORDER BY e.approved,name`).all();
+  const locations = db.prepare('SELECT id,name FROM work_locations WHERE active=1 ORDER BY name').all();
+  const locationOptions = (selected) => `<option value="">未選擇分店</option>${locations.map((location) => `<option value="${location.id}" ${Number(selected) === Number(location.id) ? 'selected' : ''}>${escapeHtml(location.name)}</option>`).join('')}`;
   const pending = employees.filter((employee) => !employee.approved);
   const active = employees.filter((employee) => employee.approved);
   const pendingHtml = pending.map((employee) => `<article class="approval-card"><div><span>等待核准</span><h2>${escapeHtml(employee.display_name)}</h2><small>首次聯絡：${escapeHtml(employee.created_at)}</small></div><form method="post" action="/admin/employee/approval"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input type="hidden" name="returnTo" value="/admin/employees"><button name="approved" value="1">核准員工</button><button class="danger" name="approved" value="-1">拒絕並移除</button></form></article>`).join('');
-  const activeHtml = active.map((employee) => `<article class="staff-card" data-staff="${escapeHtml(`${employee.name} ${employee.employee_no} ${employee.department}`.toLowerCase())}"><div class="staff-title"><div><span>${escapeHtml(employee.department || '未設定部門')}</span><h2>${escapeHtml(employee.name)}</h2><small>LINE：${escapeHtml(employee.display_name)}</small></div><form method="post" action="/admin/employee/approval" onsubmit="return confirm('確定停用此員工？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input type="hidden" name="returnTo" value="/admin/employees"><button class="danger" name="approved" value="0">停用</button></form></div><form class="profile-form employee-center-form" method="post" action="/admin/employee/profile"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input type="hidden" name="returnTo" value="/admin/employees"><label>公司姓名<input name="name" value="${escapeHtml(employee.custom_name || '')}" maxlength="50"></label><label>員工編號<input name="employeeNo" value="${escapeHtml(employee.employee_no || '')}" maxlength="30"></label><label>部門<input name="department" value="${escapeHtml(employee.department || '')}" maxlength="50"></label><label>到職日<input type="date" name="hireDate" value="${escapeHtml(employee.hire_date || '')}"></label><label>離職日<input type="date" name="terminationDate" value="${escapeHtml(employee.termination_date || '')}"></label><label>薪資類型<select name="salaryType"><option value="hourly" ${employee.salary_type === 'hourly' ? 'selected' : ''}>時薪</option><option value="monthly" ${employee.salary_type === 'monthly' ? 'selected' : ''}>月薪</option></select></label><label>時薪<input type="number" name="hourlyRate" value="${Number(employee.hourly_rate || 0)}" min="0" step="1"></label><label>月薪<input type="number" name="monthlySalary" value="${Number(employee.monthly_salary || 0)}" min="0" step="1"></label><button>儲存資料</button></form></article>`).join('');
+  const activeHtml = active.map((employee) => `<article class="staff-card" data-staff="${escapeHtml(`${employee.name} ${employee.employee_no} ${employee.department} ${employee.work_location_name}`.toLowerCase())}"><div class="staff-title"><div><span>${escapeHtml(employee.department || '未設定部門')} · ${escapeHtml(employee.work_location_name)}</span><h2>${escapeHtml(employee.name)}</h2><small>LINE：${escapeHtml(employee.display_name)}</small></div><form method="post" action="/admin/employee/approval" onsubmit="return confirm('確定停用此員工？')"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input type="hidden" name="returnTo" value="/admin/employees"><button class="danger" name="approved" value="0">停用</button></form></div><form class="profile-form employee-center-form" method="post" action="/admin/employee/profile"><input type="hidden" name="csrf" value="${csrfValue}"><input type="hidden" name="userId" value="${escapeHtml(employee.line_user_id)}"><input type="hidden" name="returnTo" value="/admin/employees"><label>公司姓名<input name="name" value="${escapeHtml(employee.custom_name || '')}" maxlength="50"></label><label>員工編號<input name="employeeNo" value="${escapeHtml(employee.employee_no || '')}" maxlength="30"></label><label>部門<input name="department" value="${escapeHtml(employee.department || '')}" maxlength="50"></label><label>分店<select name="workLocationId">${locationOptions(employee.work_location_id)}</select></label><label>到職日<input type="date" name="hireDate" value="${escapeHtml(employee.hire_date || '')}"></label><label>離職日<input type="date" name="terminationDate" value="${escapeHtml(employee.termination_date || '')}"></label><label>薪資類型<select name="salaryType"><option value="hourly" ${employee.salary_type === 'hourly' ? 'selected' : ''}>時薪</option><option value="monthly" ${employee.salary_type === 'monthly' ? 'selected' : ''}>月薪</option></select></label><label>時薪<input type="number" name="hourlyRate" value="${Number(employee.hourly_rate || 0)}" min="0" step="1"></label><label>月薪<input type="number" name="monthlySalary" value="${Number(employee.monthly_salary || 0)}" min="0" step="1"></label><button>儲存資料</button></form></article>`).join('');
   res.send(page('員工中心', `<header><div><h1>員工中心</h1><p>${active.length} 位在職 · ${pending.length} 位待核准</p></div><nav><a href="/admin">返回出勤管理</a><a href="/admin/payroll">薪資中心</a><a href="/admin/logout">登出</a></nav></header><main class="standalone employee-center">${pending.length ? `<section class="approval-section"><div class="panel-title"><span>待處理</span><h2>新員工申請</h2></div>${pendingHtml}</section>` : ''}<section class="staff-toolbar"><div><span>員工名冊</span><h2>在職員工</h2></div><input id="staff-search" placeholder="搜尋姓名、編號或部門…"></section><section class="staff-grid">${activeHtml || '<div class="all-clear">尚無已核准員工</div>'}</section></main><script>document.getElementById('staff-search')?.addEventListener('input',function(){const q=this.value.trim().toLowerCase();document.querySelectorAll('[data-staff]').forEach(card=>card.hidden=!card.dataset.staff.includes(q))})</script>`));
 });
 
@@ -1055,9 +1102,11 @@ app.post('/admin/employee/name', requireAdmin, requireCsrf, (req, res) => {
 app.post('/admin/employee/profile', requireAdmin, requireCsrf, (req, res) => {
   const date = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value || '') ? value : '';
   const salaryType = req.body.salaryType === 'monthly' ? 'monthly' : 'hourly';
-  db.prepare(`UPDATE employees SET custom_name=?,employee_no=?,department=?,hire_date=?,termination_date=?,salary_type=?,hourly_rate=?,monthly_salary=? WHERE line_user_id=?`)
-    .run(String(req.body.name || '').trim().slice(0, 50), String(req.body.employeeNo || '').trim().slice(0, 30), String(req.body.department || '').trim().slice(0, 50), date(req.body.hireDate), date(req.body.terminationDate), salaryType, Math.max(0, Number(req.body.hourlyRate) || 0), Math.max(0, Number(req.body.monthlySalary) || 0), req.body.userId);
-  audit('修改員工與薪資資料', 'employee', req.body.userId, `編號=${String(req.body.employeeNo || '').slice(0, 30)}；部門=${String(req.body.department || '').slice(0, 50)}；薪資類型=${salaryType}`, req.admin.username);
+  const requestedLocationId = Number(req.body.workLocationId);
+  const workLocationId = Number.isInteger(requestedLocationId) && db.prepare('SELECT id FROM work_locations WHERE id=? AND active=1').get(requestedLocationId) ? requestedLocationId : null;
+  db.prepare(`UPDATE employees SET custom_name=?,employee_no=?,department=?,hire_date=?,termination_date=?,salary_type=?,hourly_rate=?,monthly_salary=?,work_location_id=? WHERE line_user_id=?`)
+    .run(String(req.body.name || '').trim().slice(0, 50), String(req.body.employeeNo || '').trim().slice(0, 30), String(req.body.department || '').trim().slice(0, 50), date(req.body.hireDate), date(req.body.terminationDate), salaryType, Math.max(0, Number(req.body.hourlyRate) || 0), Math.max(0, Number(req.body.monthlySalary) || 0), workLocationId, req.body.userId);
+  audit('修改員工與薪資資料', 'employee', req.body.userId, `編號=${String(req.body.employeeNo || '').slice(0, 30)}；部門=${String(req.body.department || '').slice(0, 50)}；薪資類型=${salaryType}；分店=${workLocationId || '未設定'}`, req.admin.username);
   const returnTo = String(req.body.returnTo || '');
   res.redirect(303, returnTo === '/admin/employees' ? returnTo : '/admin');
 });
